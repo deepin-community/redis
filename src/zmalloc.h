@@ -61,12 +61,31 @@
 #define zmalloc_size(p) malloc_size(p)
 #endif
 
+/* On native libc implementations, we should still do our best to provide a
+ * HAVE_MALLOC_SIZE capability. This can be set explicitly as well:
+ *
+ * NO_MALLOC_USABLE_SIZE disables it on all platforms, even if they are
+ *      known to support it.
+ * USE_MALLOC_USABLE_SIZE forces use of malloc_usable_size() regardless
+ *      of platform.
+ */
 #ifndef ZMALLOC_LIB
 #define ZMALLOC_LIB "libc"
-#ifdef __GLIBC__
+
+#if !defined(NO_MALLOC_USABLE_SIZE) && \
+    (defined(__GLIBC__) || defined(__FreeBSD__) || \
+     defined(USE_MALLOC_USABLE_SIZE))
+
+/* Includes for malloc_usable_size() */
+#ifdef __FreeBSD__
+#include <malloc_np.h>
+#else
 #include <malloc.h>
+#endif
+
 #define HAVE_MALLOC_SIZE 1
 #define zmalloc_size(p) malloc_usable_size(p)
+
 #endif
 #endif
 
@@ -79,8 +98,19 @@
 
 void *zmalloc(size_t size);
 void *zcalloc(size_t size);
+void *zcalloc_num(size_t num, size_t size);
 void *zrealloc(void *ptr, size_t size);
+void *ztrymalloc(size_t size);
+void *ztrycalloc(size_t size);
+void *ztryrealloc(void *ptr, size_t size);
 void zfree(void *ptr);
+void *zmalloc_usable(size_t size, size_t *usable);
+void *zcalloc_usable(size_t size, size_t *usable);
+void *zrealloc_usable(void *ptr, size_t size, size_t *usable);
+void *ztrymalloc_usable(size_t size, size_t *usable);
+void *ztrycalloc_usable(size_t size, size_t *usable);
+void *ztryrealloc_usable(void *ptr, size_t size, size_t *usable);
+void zfree_usable(void *ptr, size_t *usable);
 char *zstrdup(const char *s);
 size_t zmalloc_used_memory(void);
 void zmalloc_set_oom_handler(void (*oom_handler)(size_t));
@@ -92,6 +122,7 @@ size_t zmalloc_get_private_dirty(long pid);
 size_t zmalloc_get_smap_bytes_by_field(char *field, long pid);
 size_t zmalloc_get_memory_size(void);
 void zlibc_free(void *ptr);
+void zmadvise_dontneed(void *ptr);
 
 #ifdef HAVE_DEFRAG
 void zfree_no_tcache(void *ptr);
@@ -100,13 +131,30 @@ void *zmalloc_no_tcache(size_t size);
 
 #ifndef HAVE_MALLOC_SIZE
 size_t zmalloc_size(void *ptr);
-size_t zmalloc_usable(void *ptr);
+size_t zmalloc_usable_size(void *ptr);
 #else
-#define zmalloc_usable(p) zmalloc_size(p)
+/* If we use 'zmalloc_usable_size()' to obtain additional available memory size
+ * and manipulate it, we need to call 'extend_to_usable()' afterwards to ensure
+ * the compiler recognizes this extra memory. However, if we use the pointer
+ * obtained from z[*]_usable() family functions, there is no need for this step. */
+#define zmalloc_usable_size(p) zmalloc_size(p)
+
+/* derived from https://github.com/systemd/systemd/pull/25688
+ * We use zmalloc_usable_size() everywhere to use memory blocks, but that is an abuse since the
+ * malloc_usable_size() isn't meant for this kind of use, it is for diagnostics only. That is also why the
+ * behavior is flaky when built with _FORTIFY_SOURCE, the compiler can sense that we reach outside
+ * the allocated block and SIGABRT.
+ * We use a dummy allocator function to tell the compiler that the new size of ptr is newsize.
+ * The implementation returns the pointer as is; the only reason for its existence is as a conduit for the
+ * alloc_size attribute. This cannot be a static inline because gcc then loses the attributes on the function.
+ * See: https://gcc.gnu.org/bugzilla/show_bug.cgi?id=96503 */
+__attribute__((alloc_size(2),noinline)) void *extend_to_usable(void *ptr, size_t size);
 #endif
 
+int get_proc_stat_ll(int i, long long *res);
+
 #ifdef REDIS_TEST
-int zmalloc_test(int argc, char **argv);
+int zmalloc_test(int argc, char **argv, int flags);
 #endif
 
 #endif /* __ZMALLOC_H */

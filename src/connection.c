@@ -147,8 +147,7 @@ void *connGetPrivateData(connection *conn) {
 /* Close the connection and free resources. */
 static void connSocketClose(connection *conn) {
     if (conn->fd != -1) {
-        aeDeleteFileEvent(server.el,conn->fd,AE_READABLE);
-        aeDeleteFileEvent(server.el,conn->fd,AE_WRITABLE);
+        aeDeleteFileEvent(server.el,conn->fd, AE_READABLE | AE_WRITABLE);
         close(conn->fd);
         conn->fd = -1;
     }
@@ -172,7 +171,22 @@ static int connSocketWrite(connection *conn, const void *data, size_t data_len) 
         /* Don't overwrite the state of a connection that is not already
          * connected, not to mess with handler callbacks.
          */
-        if (conn->state == CONN_STATE_CONNECTED)
+        if (errno != EINTR && conn->state == CONN_STATE_CONNECTED)
+            conn->state = CONN_STATE_ERROR;
+    }
+
+    return ret;
+}
+
+static int connSocketWritev(connection *conn, const struct iovec *iov, int iovcnt) {
+    int ret = writev(conn->fd, iov, iovcnt);
+    if (ret < 0 && errno != EAGAIN) {
+        conn->last_errno = errno;
+
+        /* Don't overwrite the state of a connection that is not already
+         * connected, not to mess with handler callbacks.
+         */
+        if (errno != EINTR && conn->state == CONN_STATE_CONNECTED)
             conn->state = CONN_STATE_ERROR;
     }
 
@@ -189,7 +203,7 @@ static int connSocketRead(connection *conn, void *buf, size_t buf_len) {
         /* Don't overwrite the state of a connection that is not already
          * connected, not to mess with handler callbacks.
          */
-        if (conn->state == CONN_STATE_CONNECTED)
+        if (errno != EINTR && conn->state == CONN_STATE_CONNECTED)
             conn->state = CONN_STATE_ERROR;
     }
 
@@ -350,6 +364,7 @@ ConnectionType CT_Socket = {
     .ae_handler = connSocketEventHandler,
     .close = connSocketClose,
     .write = connSocketWrite,
+    .writev = connSocketWritev,
     .read = connSocketRead,
     .accept = connSocketAccept,
     .connect = connSocketConnect,
@@ -374,15 +389,19 @@ int connGetSocketError(connection *conn) {
 }
 
 int connPeerToString(connection *conn, char *ip, size_t ip_len, int *port) {
-    return anetPeerToString(conn ? conn->fd : -1, ip, ip_len, port);
-}
-
-int connFormatPeer(connection *conn, char *buf, size_t buf_len) {
-    return anetFormatPeer(conn ? conn->fd : -1, buf, buf_len);
+    if (anetFdToString(conn ? conn->fd : -1, ip, ip_len, port, FD_TO_PEER_NAME) == -1) {
+        if (conn) conn->last_errno = errno;
+        return C_ERR;
+    }
+    return C_OK;
 }
 
 int connSockName(connection *conn, char *ip, size_t ip_len, int *port) {
-    return anetSockName(conn->fd, ip, ip_len, port);
+    return anetFdToString(conn->fd, ip, ip_len, port, FD_TO_SOCK_NAME);
+}
+
+int connFormatFdAddr(connection *conn, char *buf, size_t buf_len, int fd_to_str_type) {
+    return anetFormatFdAddr(conn ? conn->fd : -1, buf, buf_len, fd_to_str_type);
 }
 
 int connBlock(connection *conn) {
@@ -428,7 +447,7 @@ int connGetState(connection *conn) {
  * For sockets, we always return "fd=<fdnum>" to maintain compatibility.
  */
 const char *connGetInfo(connection *conn, char *buf, size_t buf_len) {
-    snprintf(buf, buf_len-1, "fd=%i", conn->fd);
+    snprintf(buf, buf_len-1, "fd=%i", conn == NULL ? -1 : conn->fd);
     return buf;
 }
 

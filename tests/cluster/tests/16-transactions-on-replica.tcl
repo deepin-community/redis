@@ -13,7 +13,7 @@ test "Cluster should start ok" {
 set primary [Rn 0]
 set replica [Rn 1]
 
-test "Cant read from replica without READONLY" {
+test "Can't read from replica without READONLY" {
     $primary SET a 1
     wait_for_ofs_sync $primary $replica
     catch {$replica GET a} err
@@ -25,7 +25,7 @@ test "Can read from replica after READONLY" {
     assert {[$replica GET a] eq {1}}
 }
 
-test "Can preform HSET primary and HGET from replica" {
+test "Can perform HSET primary and HGET from replica" {
     $primary HSET h a 1
     $primary HSET h b 2
     $primary HSET h c 3
@@ -68,4 +68,12 @@ test "read-only blocking operations from replica" {
     set res [lindex [lindex [lindex [lindex $res 0] 1] 0] 1]
     assert {$res eq {foo bar}}
     $rd close
+}
+
+test "reply MOVED when eval from replica for update" {
+    catch {[$replica eval {#!lua
+        return redis.call('del','a')
+        } 1 a
+    ]} err
+    assert {[string range $err 0 4] eq {MOVED}}
 }

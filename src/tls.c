@@ -34,10 +34,15 @@
 
 #ifdef USE_OPENSSL
 
+#include <openssl/conf.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
 #include <openssl/pem.h>
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+#include <openssl/decoder.h>
+#endif
+#include <sys/uio.h>
 
 #define REDIS_TLS_PROTO_TLSv1       (1<<0)
 #define REDIS_TLS_PROTO_TLSv1_1     (1<<1)
@@ -53,7 +58,8 @@
 
 extern ConnectionType CT_Socket;
 
-SSL_CTX *redis_tls_ctx;
+SSL_CTX *redis_tls_ctx = NULL;
+SSL_CTX *redis_tls_client_ctx = NULL;
 
 static int parseProtocolsConfig(const char *str) {
     int i, count = 0;
@@ -136,9 +142,21 @@ static void initCryptoLocks(void) {
 #endif /* USE_CRYPTO_LOCKS */
 
 void tlsInit(void) {
-    ERR_load_crypto_strings();
+    /* Enable configuring OpenSSL using the standard openssl.cnf
+     * OPENSSL_config()/OPENSSL_init_crypto() should be the first 
+     * call to the OpenSSL* library.
+     *  - OPENSSL_config() should be used for OpenSSL versions < 1.1.0
+     *  - OPENSSL_init_crypto() should be used for OpenSSL versions >= 1.1.0
+     */
+    #if OPENSSL_VERSION_NUMBER < 0x10100000L
+    OPENSSL_config(NULL);
     SSL_load_error_strings();
     SSL_library_init();
+    #elif OPENSSL_VERSION_NUMBER < 0x10101000L
+    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, NULL);
+    #else
+    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG|OPENSSL_INIT_ATFORK, NULL);
+    #endif
 
 #ifdef USE_CRYPTO_LOCKS
     initCryptoLocks();
@@ -151,49 +169,54 @@ void tlsInit(void) {
     pending_list = listCreate();
 }
 
-/* Attempt to configure/reconfigure TLS. This operation is atomic and will
- * leave the SSL_CTX unchanged if fails.
+void tlsCleanup(void) {
+    if (redis_tls_ctx) {
+        SSL_CTX_free(redis_tls_ctx);
+        redis_tls_ctx = NULL;
+    }
+    if (redis_tls_client_ctx) {
+        SSL_CTX_free(redis_tls_client_ctx);
+        redis_tls_client_ctx = NULL;
+    }
+
+    #if OPENSSL_VERSION_NUMBER >= 0x10100000L && !defined(LIBRESSL_VERSION_NUMBER)
+    // unavailable on LibreSSL
+    OPENSSL_cleanup();
+    #endif
+}
+
+/* Callback for passing a keyfile password stored as an sds to OpenSSL */
+static int tlsPasswordCallback(char *buf, int size, int rwflag, void *u) {
+    UNUSED(rwflag);
+
+    const char *pass = u;
+    size_t pass_len;
+
+    if (!pass) return -1;
+    pass_len = strlen(pass);
+    if (pass_len > (size_t) size) return -1;
+    memcpy(buf, pass, pass_len);
+
+    return (int) pass_len;
+}
+
+/* Create a *base* SSL_CTX using the SSL configuration provided. The base context
+ * includes everything that's common for both client-side and server-side connections.
  */
-int tlsConfigure(redisTLSContextConfig *ctx_config) {
+static SSL_CTX *createSSLContext(redisTLSContextConfig *ctx_config, int protocols, int client) {
+    const char *cert_file = client ? ctx_config->client_cert_file : ctx_config->cert_file;
+    const char *key_file = client ? ctx_config->client_key_file : ctx_config->key_file;
+    const char *key_file_pass = client ? ctx_config->client_key_file_pass : ctx_config->key_file_pass;
     char errbuf[256];
     SSL_CTX *ctx = NULL;
-
-    if (!ctx_config->cert_file) {
-        serverLog(LL_WARNING, "No tls-cert-file configured!");
-        goto error;
-    }
-
-    if (!ctx_config->key_file) {
-        serverLog(LL_WARNING, "No tls-key-file configured!");
-        goto error;
-    }
-
-    if (((server.tls_auth_clients != TLS_CLIENT_AUTH_NO) || server.tls_cluster || server.tls_replication) &&
-            !ctx_config->ca_cert_file && !ctx_config->ca_cert_dir) {
-        serverLog(LL_WARNING, "Either tls-ca-cert-file or tls-ca-cert-dir must be specified when tls-cluster, tls-replication or tls-auth-clients are enabled!");
-        goto error;
-    }
 
     ctx = SSL_CTX_new(SSLv23_method());
 
     SSL_CTX_set_options(ctx, SSL_OP_NO_SSLv2|SSL_OP_NO_SSLv3);
-    SSL_CTX_set_options(ctx, SSL_OP_SINGLE_DH_USE);
 
 #ifdef SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS
     SSL_CTX_set_options(ctx, SSL_OP_DONT_INSERT_EMPTY_FRAGMENTS);
 #endif
-
-    if (ctx_config->session_caching) {
-        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
-        SSL_CTX_sess_set_cache_size(ctx, ctx_config->session_cache_size);
-        SSL_CTX_set_timeout(ctx, ctx_config->session_cache_timeout);
-        SSL_CTX_set_session_id_context(ctx, (void *) "redis", 5);
-    } else {
-        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
-    }
-
-    int protocols = parseProtocolsConfig(ctx_config->protocols);
-    if (protocols == -1) goto error;
 
     if (!(protocols & REDIS_TLS_PROTO_TLSv1))
         SSL_CTX_set_options(ctx, SSL_OP_NO_TLSv1);
@@ -212,61 +235,29 @@ int tlsConfigure(redisTLSContextConfig *ctx_config) {
     SSL_CTX_set_options(ctx, SSL_OP_NO_COMPRESSION);
 #endif
 
-#ifdef SSL_OP_NO_CLIENT_RENEGOTIATION
-    SSL_CTX_set_options(ctx, SSL_OP_NO_CLIENT_RENEGOTIATION);
-#endif
-
-    if (ctx_config->prefer_server_ciphers)
-        SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
-
     SSL_CTX_set_mode(ctx, SSL_MODE_ENABLE_PARTIAL_WRITE|SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
     SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER|SSL_VERIFY_FAIL_IF_NO_PEER_CERT, NULL);
-#if defined(SSL_CTX_set_ecdh_auto)
-    SSL_CTX_set_ecdh_auto(ctx, 1);
-#endif
 
-    if (SSL_CTX_use_certificate_chain_file(ctx, ctx_config->cert_file) <= 0) {
+    SSL_CTX_set_default_passwd_cb(ctx, tlsPasswordCallback);
+    SSL_CTX_set_default_passwd_cb_userdata(ctx, (void *) key_file_pass);
+
+    if (SSL_CTX_use_certificate_chain_file(ctx, cert_file) <= 0) {
         ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
-        serverLog(LL_WARNING, "Failed to load certificate: %s: %s", ctx_config->cert_file, errbuf);
+        serverLog(LL_WARNING, "Failed to load certificate: %s: %s", cert_file, errbuf);
         goto error;
     }
-        
-    if (SSL_CTX_use_PrivateKey_file(ctx, ctx_config->key_file, SSL_FILETYPE_PEM) <= 0) {
+
+    if (SSL_CTX_use_PrivateKey_file(ctx, key_file, SSL_FILETYPE_PEM) <= 0) {
         ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
-        serverLog(LL_WARNING, "Failed to load private key: %s: %s", ctx_config->key_file, errbuf);
+        serverLog(LL_WARNING, "Failed to load private key: %s: %s", key_file, errbuf);
         goto error;
     }
-    
+
     if ((ctx_config->ca_cert_file || ctx_config->ca_cert_dir) &&
         SSL_CTX_load_verify_locations(ctx, ctx_config->ca_cert_file, ctx_config->ca_cert_dir) <= 0) {
         ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
         serverLog(LL_WARNING, "Failed to configure CA certificate(s) file/directory: %s", errbuf);
         goto error;
-    }
-
-    if (ctx_config->dh_params_file) {
-        FILE *dhfile = fopen(ctx_config->dh_params_file, "r");
-        DH *dh = NULL;
-        if (!dhfile) {
-            serverLog(LL_WARNING, "Failed to load %s: %s", ctx_config->dh_params_file, strerror(errno));
-            goto error;
-        }
-
-        dh = PEM_read_DHparams(dhfile, NULL, NULL, NULL);
-        fclose(dhfile);
-        if (!dh) {
-            serverLog(LL_WARNING, "%s: failed to read DH params.", ctx_config->dh_params_file);
-            goto error;
-        }
-
-        if (SSL_CTX_set_tmp_dh(ctx, dh) <= 0) {
-            ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
-            serverLog(LL_WARNING, "Failed to load DH params file: %s: %s", ctx_config->dh_params_file, errbuf);
-            DH_free(dh);
-            goto error;
-        }
-
-        DH_free(dh);
     }
 
     if (ctx_config->ciphers && !SSL_CTX_set_cipher_list(ctx, ctx_config->ciphers)) {
@@ -281,14 +272,144 @@ int tlsConfigure(redisTLSContextConfig *ctx_config) {
     }
 #endif
 
+    return ctx;
+
+error:
+    if (ctx) SSL_CTX_free(ctx);
+    return NULL;
+}
+
+/* Attempt to configure/reconfigure TLS. This operation is atomic and will
+ * leave the SSL_CTX unchanged if fails.
+ */
+int tlsConfigure(redisTLSContextConfig *ctx_config) {
+    char errbuf[256];
+    SSL_CTX *ctx = NULL;
+    SSL_CTX *client_ctx = NULL;
+
+    if (!ctx_config->cert_file) {
+        serverLog(LL_WARNING, "No tls-cert-file configured!");
+        goto error;
+    }
+
+    if (!ctx_config->key_file) {
+        serverLog(LL_WARNING, "No tls-key-file configured!");
+        goto error;
+    }
+
+    if (((server.tls_auth_clients != TLS_CLIENT_AUTH_NO) || server.tls_cluster || server.tls_replication) &&
+            !ctx_config->ca_cert_file && !ctx_config->ca_cert_dir) {
+        serverLog(LL_WARNING, "Either tls-ca-cert-file or tls-ca-cert-dir must be specified when tls-cluster, tls-replication or tls-auth-clients are enabled!");
+        goto error;
+    }
+
+    int protocols = parseProtocolsConfig(ctx_config->protocols);
+    if (protocols == -1) goto error;
+
+    /* Create server side/generla context */
+    ctx = createSSLContext(ctx_config, protocols, 0);
+    if (!ctx) goto error;
+
+    if (ctx_config->session_caching) {
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_SERVER);
+        SSL_CTX_sess_set_cache_size(ctx, ctx_config->session_cache_size);
+        SSL_CTX_set_timeout(ctx, ctx_config->session_cache_timeout);
+        SSL_CTX_set_session_id_context(ctx, (void *) "redis", 5);
+    } else {
+        SSL_CTX_set_session_cache_mode(ctx, SSL_SESS_CACHE_OFF);
+    }
+
+#ifdef SSL_OP_NO_CLIENT_RENEGOTIATION
+    SSL_CTX_set_options(ctx, SSL_OP_NO_CLIENT_RENEGOTIATION);
+#endif
+
+    if (ctx_config->prefer_server_ciphers)
+        SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
+
+#if ((OPENSSL_VERSION_NUMBER < 0x30000000L) && defined(SSL_CTX_set_ecdh_auto))
+    SSL_CTX_set_ecdh_auto(ctx, 1);
+#endif
+    SSL_CTX_set_options(ctx, SSL_OP_SINGLE_DH_USE);
+
+    if (ctx_config->dh_params_file) {
+        FILE *dhfile = fopen(ctx_config->dh_params_file, "r");
+        if (!dhfile) {
+            serverLog(LL_WARNING, "Failed to load %s: %s", ctx_config->dh_params_file, strerror(errno));
+            goto error;
+        }
+
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+        EVP_PKEY *pkey = NULL;
+        OSSL_DECODER_CTX *dctx = OSSL_DECODER_CTX_new_for_pkey(
+                &pkey, "PEM", NULL, "DH", OSSL_KEYMGMT_SELECT_DOMAIN_PARAMETERS, NULL, NULL);
+        if (!dctx) {
+            serverLog(LL_WARNING, "No decoder for DH params.");
+            fclose(dhfile);
+            goto error;
+        }
+        if (!OSSL_DECODER_from_fp(dctx, dhfile)) {
+            serverLog(LL_WARNING, "%s: failed to read DH params.", ctx_config->dh_params_file);
+            OSSL_DECODER_CTX_free(dctx);
+            fclose(dhfile);
+            goto error;
+        }
+
+        OSSL_DECODER_CTX_free(dctx);
+        fclose(dhfile);
+
+        if (SSL_CTX_set0_tmp_dh_pkey(ctx, pkey) <= 0) {
+            ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
+            serverLog(LL_WARNING, "Failed to load DH params file: %s: %s", ctx_config->dh_params_file, errbuf);
+            EVP_PKEY_free(pkey);
+            goto error;
+        }
+        /* Not freeing pkey, it is owned by OpenSSL now */
+#else
+        DH *dh = PEM_read_DHparams(dhfile, NULL, NULL, NULL);
+        fclose(dhfile);
+        if (!dh) {
+            serverLog(LL_WARNING, "%s: failed to read DH params.", ctx_config->dh_params_file);
+            goto error;
+        }
+
+        if (SSL_CTX_set_tmp_dh(ctx, dh) <= 0) {
+            ERR_error_string_n(ERR_get_error(), errbuf, sizeof(errbuf));
+            serverLog(LL_WARNING, "Failed to load DH params file: %s: %s", ctx_config->dh_params_file, errbuf);
+            DH_free(dh);
+            goto error;
+        }
+
+        DH_free(dh);
+#endif
+    } else {
+#if (OPENSSL_VERSION_NUMBER >= 0x30000000L)
+        SSL_CTX_set_dh_auto(ctx, 1);
+#endif
+    }
+
+    /* If a client-side certificate is configured, create an explicit client context */
+    if (ctx_config->client_cert_file && ctx_config->client_key_file) {
+        client_ctx = createSSLContext(ctx_config, protocols, 1);
+        if (!client_ctx) goto error;
+    }
+
     SSL_CTX_free(redis_tls_ctx);
+    SSL_CTX_free(redis_tls_client_ctx);
     redis_tls_ctx = ctx;
+    redis_tls_client_ctx = client_ctx;
 
     return C_OK;
 
 error:
     if (ctx) SSL_CTX_free(ctx);
+    if (client_ctx) SSL_CTX_free(client_ctx);
     return C_ERR;
+}
+
+/* Return 1 if TLS was already configured, 0 otherwise.
+ */
+int isTlsConfigured(void) {
+    return redis_tls_ctx != NULL;
 }
 
 #ifdef TLS_DEBUGGING
@@ -307,7 +428,7 @@ ConnectionType CT_TLS;
  * socket operation.
  *
  * When this happens, we need to do two things:
- * 1. Make sure we register for the even.
+ * 1. Make sure we register for the event.
  * 2. Make sure we know which handler needs to execute when the
  *    event fires.  That is, if we notify the caller of a write operation
  *    that it blocks, and SSL asks for a read, we need to trigger the
@@ -332,12 +453,19 @@ typedef struct tls_connection {
     listNode *pending_list_node;
 } tls_connection;
 
-connection *connCreateTLS(void) {
+static connection *createTLSConnection(int client_side) {
+    SSL_CTX *ctx = redis_tls_ctx;
+    if (client_side && redis_tls_client_ctx)
+        ctx = redis_tls_client_ctx;
     tls_connection *conn = zcalloc(sizeof(tls_connection));
     conn->c.type = &CT_TLS;
     conn->c.fd = -1;
-    conn->ssl = SSL_new(redis_tls_ctx);
+    conn->ssl = SSL_new(ctx);
     return (connection *) conn;
+}
+
+connection *connCreateTLS(void) {
+    return createTLSConnection(1);
 }
 
 /* Fetch the latest OpenSSL error and store it in the connection */
@@ -358,7 +486,7 @@ static void updateTLSError(tls_connection *conn) {
  * is not in an error state.
  */
 connection *connCreateAcceptedTLS(int fd, int require_auth) {
-    tls_connection *conn = (tls_connection *) connCreateTLS();
+    tls_connection *conn = (tls_connection *) createTLSConnection(0);
     conn->c.fd = fd;
     conn->c.state = CONN_STATE_ACCEPTING;
 
@@ -387,10 +515,11 @@ connection *connCreateAcceptedTLS(int fd, int require_auth) {
 }
 
 static void tlsEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask);
+static void updateSSLEvent(tls_connection *conn);
 
 /* Process the return code received from OpenSSL>
  * Update the want parameter with expected I/O.
- * Update the connection's error state if a real error has occured.
+ * Update the connection's error state if a real error has occurred.
  * Returns an SSL error code, or 0 if no further handling is required.
  */
 static int handleSSLReturnCode(tls_connection *conn, int ret_value, WantIOType *want) {
@@ -420,7 +549,48 @@ static int handleSSLReturnCode(tls_connection *conn, int ret_value, WantIOType *
     return 0;
 }
 
-void registerSSLEvent(tls_connection *conn, WantIOType want) {
+/* Handle OpenSSL return code following SSL_write() or SSL_read():
+ *
+ * - Updates conn state and last_errno.
+ * - If update_event is nonzero, calls updateSSLEvent() when necessary.
+ *
+ * Returns ret_value, or -1 on error or dropped connection.
+ */
+static int updateStateAfterSSLIO(tls_connection *conn, int ret_value, int update_event) {
+    /* If system call was interrupted, there's no need to go through the full
+     * OpenSSL error handling and just report this for the caller to retry the
+     * operation.
+     */
+    if (errno == EINTR) {
+        conn->c.last_errno = EINTR;
+        return -1;
+    }
+
+    if (ret_value <= 0) {
+        WantIOType want = 0;
+        int ssl_err;
+        if (!(ssl_err = handleSSLReturnCode(conn, ret_value, &want))) {
+            if (want == WANT_READ) conn->flags |= TLS_CONN_FLAG_WRITE_WANT_READ;
+            if (want == WANT_WRITE) conn->flags |= TLS_CONN_FLAG_READ_WANT_WRITE;
+            if (update_event) updateSSLEvent(conn);
+            errno = EAGAIN;
+            return -1;
+        } else {
+            if (ssl_err == SSL_ERROR_ZERO_RETURN ||
+                ((ssl_err == SSL_ERROR_SYSCALL && !errno))) {
+                conn->c.state = CONN_STATE_CLOSED;
+                return -1;
+            } else {
+                conn->c.state = CONN_STATE_ERROR;
+                return -1;
+            }
+        }
+    }
+
+    return ret_value;
+}
+
+static void registerSSLEvent(tls_connection *conn, WantIOType want) {
     int mask = aeGetFileEvents(server.el, conn->c.fd);
 
     switch (want) {
@@ -594,6 +764,8 @@ static void connTLSClose(connection *conn_) {
     tls_connection *conn = (tls_connection *) conn_;
 
     if (conn->ssl) {
+        if (conn->c.state == CONN_STATE_CONNECTED)
+            SSL_shutdown(conn->ssl);
         SSL_free(conn->ssl);
         conn->ssl = NULL;
     }
@@ -657,63 +829,59 @@ static int connTLSConnect(connection *conn_, const char *addr, int port, const c
 
 static int connTLSWrite(connection *conn_, const void *data, size_t data_len) {
     tls_connection *conn = (tls_connection *) conn_;
-    int ret, ssl_err;
+    int ret;
 
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
     ERR_clear_error();
     ret = SSL_write(conn->ssl, data, data_len);
+    return updateStateAfterSSLIO(conn, ret, 1);
+}
 
-    if (ret <= 0) {
-        WantIOType want = 0;
-        if (!(ssl_err = handleSSLReturnCode(conn, ret, &want))) {
-            if (want == WANT_READ) conn->flags |= TLS_CONN_FLAG_WRITE_WANT_READ;
-            updateSSLEvent(conn);
-            errno = EAGAIN;
-            return -1;
-        } else {
-            if (ssl_err == SSL_ERROR_ZERO_RETURN ||
-                    ((ssl_err == SSL_ERROR_SYSCALL && !errno))) {
-                conn->c.state = CONN_STATE_CLOSED;
-                return 0;
-            } else {
-                conn->c.state = CONN_STATE_ERROR;
-                return -1;
-            }
-        }
+static int connTLSWritev(connection *conn_, const struct iovec *iov, int iovcnt) {
+    if (iovcnt == 1) return connTLSWrite(conn_, iov[0].iov_base, iov[0].iov_len);
+
+    /* Accumulate the amount of bytes of each buffer and check if it exceeds NET_MAX_WRITES_PER_EVENT. */
+    size_t iov_bytes_len = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        iov_bytes_len += iov[i].iov_len;
+        if (iov_bytes_len > NET_MAX_WRITES_PER_EVENT) break;
     }
 
-    return ret;
+    /* The amount of all buffers is greater than NET_MAX_WRITES_PER_EVENT, 
+     * which is not worth doing so much memory copying to reduce system calls,
+     * therefore, invoke connTLSWrite() multiple times to avoid memory copies. */
+    if (iov_bytes_len > NET_MAX_WRITES_PER_EVENT) {
+        ssize_t tot_sent = 0;
+        for (int i = 0; i < iovcnt; i++) {
+            ssize_t sent = connTLSWrite(conn_, iov[i].iov_base, iov[i].iov_len);
+            if (sent <= 0) return tot_sent > 0 ? tot_sent : sent;
+            tot_sent += sent;
+            if ((size_t) sent != iov[i].iov_len) break;
+        }
+        return tot_sent;
+    }
+
+    /* The amount of all buffers is less than NET_MAX_WRITES_PER_EVENT, 
+     * which is worth doing more memory copies in exchange for fewer system calls, 
+     * so concatenate these scattered buffers into a contiguous piece of memory 
+     * and send it away by one call to connTLSWrite(). */
+    char buf[iov_bytes_len];
+    size_t offset = 0;
+    for (int i = 0; i < iovcnt; i++) {
+        memcpy(buf + offset, iov[i].iov_base, iov[i].iov_len);
+        offset += iov[i].iov_len;
+    }
+    return connTLSWrite(conn_, buf, iov_bytes_len);
 }
 
 static int connTLSRead(connection *conn_, void *buf, size_t buf_len) {
     tls_connection *conn = (tls_connection *) conn_;
     int ret;
-    int ssl_err;
 
     if (conn->c.state != CONN_STATE_CONNECTED) return -1;
     ERR_clear_error();
     ret = SSL_read(conn->ssl, buf, buf_len);
-    if (ret <= 0) {
-        WantIOType want = 0;
-        if (!(ssl_err = handleSSLReturnCode(conn, ret, &want))) {
-            if (want == WANT_WRITE) conn->flags |= TLS_CONN_FLAG_READ_WANT_WRITE;
-            updateSSLEvent(conn);
-
-            errno = EAGAIN;
-            return -1;
-        } else {
-            if (ssl_err == SSL_ERROR_ZERO_RETURN ||
-                    ((ssl_err == SSL_ERROR_SYSCALL) && !errno)) {
-                conn->c.state = CONN_STATE_CLOSED;
-                return 0;
-            } else {
-                conn->c.state = CONN_STATE_ERROR;
-                return -1;
-            }
-        }
-    }
-
-    return ret;
+    return updateStateAfterSSLIO(conn, ret, 1);
 }
 
 static const char *connTLSGetLastError(connection *conn_) {
@@ -780,7 +948,9 @@ static ssize_t connTLSSyncWrite(connection *conn_, char *ptr, ssize_t size, long
 
     setBlockingTimeout(conn, timeout);
     SSL_clear_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
+    ERR_clear_error();
     int ret = SSL_write(conn->ssl, ptr, size);
+    ret = updateStateAfterSSLIO(conn, ret, 0);
     SSL_set_mode(conn->ssl, SSL_MODE_ENABLE_PARTIAL_WRITE);
     unsetBlockingTimeout(conn);
 
@@ -791,7 +961,9 @@ static ssize_t connTLSSyncRead(connection *conn_, char *ptr, ssize_t size, long 
     tls_connection *conn = (tls_connection *) conn_;
 
     setBlockingTimeout(conn, timeout);
+    ERR_clear_error();
     int ret = SSL_read(conn->ssl, ptr, size);
+    ret = updateStateAfterSSLIO(conn, ret, 0);
     unsetBlockingTimeout(conn);
 
     return ret;
@@ -807,7 +979,10 @@ static ssize_t connTLSSyncReadLine(connection *conn_, char *ptr, ssize_t size, l
     while(size) {
         char c;
 
-        if (SSL_read(conn->ssl,&c,1) <= 0) {
+        ERR_clear_error();
+        int ret = SSL_read(conn->ssl, &c, 1);
+        ret = updateStateAfterSSLIO(conn, ret, 0);
+        if (ret <= 0) {
             nread = -1;
             goto exit;
         }
@@ -840,6 +1015,7 @@ ConnectionType CT_TLS = {
     .blocking_connect = connTLSBlockingConnect,
     .read = connTLSRead,
     .write = connTLSWrite,
+    .writev = connTLSWritev,
     .close = connTLSClose,
     .set_write_handler = connTLSSetWriteHandler,
     .set_read_handler = connTLSSetReadHandler,
@@ -896,6 +1072,9 @@ sds connTLSGetPeerCert(connection *conn_) {
 #else   /* USE_OPENSSL */
 
 void tlsInit(void) {
+}
+
+void tlsCleanup(void) {
 }
 
 int tlsConfigure(redisTLSContextConfig *ctx_config) {

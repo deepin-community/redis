@@ -21,7 +21,7 @@ proc test_memory_efficiency {range} {
     return $efficiency
 }
 
-start_server {tags {"memefficiency"}} {
+start_server {tags {"memefficiency external:skip"}} {
     foreach {size_range expected_min_efficiency} {
         32    0.15
         64    0.25
@@ -37,10 +37,9 @@ start_server {tags {"memefficiency"}} {
 }
 
 run_solo {defrag} {
-start_server {tags {"defrag"}} {
-    if {[string match {*jemalloc*} [s mem_allocator]]} {
+start_server {tags {"defrag external:skip"} overrides {appendonly yes auto-aof-rewrite-percentage 0 save ""}} {
+    if {[string match {*jemalloc*} [s mem_allocator]] && [r debug mallctl arenas.page] <= 8192} {
         test "Active defrag" {
-            r config set save "" ;# prevent bgsave from interfereing with save below
             r config set hz 100
             r config set activedefrag no
             r config set active-defrag-threshold-lower 5
@@ -49,9 +48,9 @@ start_server {tags {"defrag"}} {
             r config set active-defrag-ignore-bytes 2mb
             r config set maxmemory 100mb
             r config set maxmemory-policy allkeys-lru
-            r debug populate 700000 asdf1 150
-            r debug populate 170000 asdf2 300
-            r ping ;# trigger eviction following the previous population
+
+            populate 700000 asdf1 150
+            populate 170000 asdf2 300
             after 120 ;# serverCron only updates the info once in 100ms
             set frag [s allocator_frag_ratio]
             if {$::verbose} {
@@ -62,9 +61,9 @@ start_server {tags {"defrag"}} {
             r config set latency-monitor-threshold 5
             r latency reset
             r config set maxmemory 110mb ;# prevent further eviction (not to fail the digest test)
-            set digest [r debug digest]
+            set digest [debug_digest]
             catch {r config set activedefrag yes} e
-            if {![string match {DISABLED*} $e]} {
+            if {[r config get activedefrag] eq "activedefrag yes"} {
                 # Wait for the active defrag to start working (decision once a
                 # second).
                 wait_for_condition 50 100 {
@@ -74,7 +73,7 @@ start_server {tags {"defrag"}} {
                 }
 
                 # Wait for the active defrag to stop working.
-                wait_for_condition 150 100 {
+                wait_for_condition 2000 100 {
                     [s active_defrag_running] eq 0
                 } else {
                     after 120 ;# serverCron only updates the info once in 100ms
@@ -83,7 +82,7 @@ start_server {tags {"defrag"}} {
                     fail "defrag didn't stop."
                 }
 
-                # Test the the fragmentation is lower.
+                # Test the fragmentation is lower.
                 after 120 ;# serverCron only updates the info once in 100ms
                 set frag [s allocator_frag_ratio]
                 set max_latency 0
@@ -109,19 +108,141 @@ start_server {tags {"defrag"}} {
                 if {!$::no_latency} {
                     assert {$max_latency <= 30}
                 }
-            } else {
-                set _ ""
             }
             # verify the data isn't corrupted or changed
-            set newdigest [r debug digest]
+            set newdigest [debug_digest]
             assert {$digest eq $newdigest}
             r save ;# saving an rdb iterates over all the data / pointers
+
+            # if defrag is supported, test AOF loading too
+            if {[r config get activedefrag] eq "activedefrag yes"} {
+                # reset stats and load the AOF file
+                r config resetstat
+                r config set key-load-delay -50 ;# sleep on average 1/50 usec
+                r debug loadaof
+                r config set activedefrag no
+                # measure hits and misses right after aof loading
+                set misses [s active_defrag_misses]
+                set hits [s active_defrag_hits]
+
+                after 120 ;# serverCron only updates the info once in 100ms
+                set frag [s allocator_frag_ratio]
+                set max_latency 0
+                foreach event [r latency latest] {
+                    lassign $event eventname time latency max
+                    if {$eventname == "while-blocked-cron"} {
+                        set max_latency $max
+                    }
+                }
+                if {$::verbose} {
+                    puts "AOF loading:"
+                    puts "frag $frag"
+                    puts "hits: $hits"
+                    puts "misses: $misses"
+                    puts "max latency $max_latency"
+                    puts [r latency latest]
+                    puts [r latency history "while-blocked-cron"]
+                }
+                # make sure we had defrag hits during AOF loading
+                assert {$hits > 100000}
+                # make sure the defragger did enough work to keep the fragmentation low during loading.
+                # we cannot check that it went all the way down, since we don't wait for full defrag cycle to complete.
+                assert {$frag < 1.4}
+                # since the AOF contains simple (fast) SET commands (and the cron during loading runs every 1000 commands),
+                # it'll still not block the loading for long periods of time.
+                if {!$::no_latency} {
+                    assert {$max_latency <= 30}
+                }
+            }
+        }
+        r config set appendonly no
+        r config set key-load-delay 0
+        
+        test "Active defrag eval scripts" {
+            r flushdb
+            r script flush sync
+            r config resetstat
+            r config set hz 100
+            r config set activedefrag no
+            r config set active-defrag-threshold-lower 5
+            r config set active-defrag-cycle-min 65
+            r config set active-defrag-cycle-max 75
+            r config set active-defrag-ignore-bytes 1500kb
+            r config set maxmemory 0
+            
+            set n 50000
+
+            # Populate memory with interleaving script-key pattern of same size
+            set dummy_script "--[string repeat x 400]\nreturn "
+            set rd [redis_deferring_client]
+            for {set j 0} {$j < $n} {incr j} {
+                set val "$dummy_script[format "%06d" $j]"
+                $rd script load $val
+                $rd set k$j $val
+            }
+            for {set j 0} {$j < $n} {incr j} {
+                $rd read ; # Discard script load replies
+                $rd read ; # Discard set replies
+            }
+            after 120 ;# serverCron only updates the info once in 100ms
+            if {$::verbose} {
+                puts "used [s allocator_allocated]"
+                puts "rss [s allocator_active]"
+                puts "frag [s allocator_frag_ratio]"
+                puts "frag_bytes [s allocator_frag_bytes]"
+            }                    
+            assert_lessthan [s allocator_frag_ratio] 1.05
+            
+            # Delete all the keys to create fragmentation
+            for {set j 0} {$j < $n} {incr j} { $rd del k$j }
+            for {set j 0} {$j < $n} {incr j} { $rd read } ; # Discard del replies
+            $rd close
+            after 120 ;# serverCron only updates the info once in 100ms
+            if {$::verbose} {
+                puts "used [s allocator_allocated]"
+                puts "rss [s allocator_active]"
+                puts "frag [s allocator_frag_ratio]"
+                puts "frag_bytes [s allocator_frag_bytes]"
+            }                    
+            assert_morethan [s allocator_frag_ratio] 1.4
+
+            catch {r config set activedefrag yes} e
+            if {[r config get activedefrag] eq "activedefrag yes"} {
+            
+                # wait for the active defrag to start working (decision once a second)
+                wait_for_condition 50 100 {
+                    [s active_defrag_running] ne 0
+                } else {
+                    fail "defrag not started."
+                }
+
+                # wait for the active defrag to stop working
+                wait_for_condition 500 100 {
+                    [s active_defrag_running] eq 0
+                } else {
+                    after 120 ;# serverCron only updates the info once in 100ms
+                    puts [r info memory]
+                    puts [r memory malloc-stats]
+                    fail "defrag didn't stop."
+                }
+
+                # test the fragmentation is lower
+                after 120 ;# serverCron only updates the info once in 100ms
+                if {$::verbose} {
+                    puts "used [s allocator_allocated]"
+                    puts "rss [s allocator_active]"
+                    puts "frag [s allocator_frag_ratio]"
+                    puts "frag_bytes [s allocator_frag_bytes]"
+                }                    
+                assert_lessthan_equal [s allocator_frag_ratio] 1.05
+            }                
+            # Flush all script to make sure we don't crash after defragging them
+            r script flush sync
         } {OK}
 
         test "Active defrag big keys" {
             r flushdb
             r config resetstat
-            r config set save "" ;# prevent bgsave from interfereing with save below
             r config set hz 100
             r config set activedefrag no
             r config set active-defrag-max-scan-fields 1000
@@ -195,9 +316,9 @@ start_server {tags {"defrag"}} {
             r config set latency-monitor-threshold 5
             r latency reset
 
-            set digest [r debug digest]
+            set digest [debug_digest]
             catch {r config set activedefrag yes} e
-            if {![string match {DISABLED*} $e]} {
+            if {[r config get activedefrag] eq "activedefrag yes"} {
                 # wait for the active defrag to start working (decision once a second)
                 wait_for_condition 50 100 {
                     [s active_defrag_running] ne 0
@@ -215,7 +336,7 @@ start_server {tags {"defrag"}} {
                     fail "defrag didn't stop."
                 }
 
-                # test the the fragmentation is lower
+                # test the fragmentation is lower
                 after 120 ;# serverCron only updates the info once in 100ms
                 set frag [s allocator_frag_ratio]
                 set max_latency 0
@@ -243,7 +364,7 @@ start_server {tags {"defrag"}} {
                 }
             }
             # verify the data isn't corrupted or changed
-            set newdigest [r debug digest]
+            set newdigest [debug_digest]
             assert {$digest eq $newdigest}
             r save ;# saving an rdb iterates over all the data / pointers
         } {OK}
@@ -251,7 +372,6 @@ start_server {tags {"defrag"}} {
         test "Active defrag big list" {
             r flushdb
             r config resetstat
-            r config set save "" ;# prevent bgsave from interfereing with save below
             r config set hz 100
             r config set activedefrag no
             r config set active-defrag-max-scan-fields 1000
@@ -292,9 +412,9 @@ start_server {tags {"defrag"}} {
             r config set latency-monitor-threshold 5
             r latency reset
 
-            set digest [r debug digest]
+            set digest [debug_digest]
             catch {r config set activedefrag yes} e
-            if {![string match {DISABLED*} $e]} {
+            if {[r config get activedefrag] eq "activedefrag yes"} {
                 # wait for the active defrag to start working (decision once a second)
                 wait_for_condition 50 100 {
                     [s active_defrag_running] ne 0
@@ -313,7 +433,7 @@ start_server {tags {"defrag"}} {
                     fail "defrag didn't stop."
                 }
 
-                # test the the fragmentation is lower
+                # test the fragmentation is lower
                 after 120 ;# serverCron only updates the info once in 100ms
                 set misses [s active_defrag_misses]
                 set hits [s active_defrag_hits]
@@ -345,7 +465,7 @@ start_server {tags {"defrag"}} {
                 assert {$misses < $elements}
             }
             # verify the data isn't corrupted or changed
-            set newdigest [r debug digest]
+            set newdigest [debug_digest]
             assert {$digest eq $newdigest}
             r save ;# saving an rdb iterates over all the data / pointers
             r del biglist1 ;# coverage for quicklistBookmarksClear
@@ -355,12 +475,11 @@ start_server {tags {"defrag"}} {
             # there was an edge case in defrag where all the slabs of a certain bin are exact the same
             # % utilization, with the exception of the current slab from which new allocations are made
             # if the current slab is lower in utilization the defragger would have ended up in stagnation,
-            # keept running and not move any allocation.
+            # kept running and not move any allocation.
             # this test is more consistent on a fresh server with no history
-            start_server {tags {"defrag"}} {
+            start_server {tags {"defrag"} overrides {save ""}} {
                 r flushdb
                 r config resetstat
-                r config set save "" ;# prevent bgsave from interfereing with save below
                 r config set hz 100
                 r config set activedefrag no
                 r config set active-defrag-max-scan-fields 1000
@@ -413,9 +532,9 @@ start_server {tags {"defrag"}} {
 
                 assert {$frag >= $expected_frag}
 
-                set digest [r debug digest]
+                set digest [debug_digest]
                 catch {r config set activedefrag yes} e
-                if {![string match {DISABLED*} $e]} {
+                if {[r config get activedefrag] eq "activedefrag yes"} {
                     # wait for the active defrag to start working (decision once a second)
                     wait_for_condition 50 100 {
                         [s active_defrag_running] ne 0
@@ -434,7 +553,7 @@ start_server {tags {"defrag"}} {
                         fail "defrag didn't stop."
                     }
 
-                    # test the the fragmentation is lower
+                    # test the fragmentation is lower
                     after 120 ;# serverCron only updates the info once in 100ms
                     set misses [s active_defrag_misses]
                     set hits [s active_defrag_hits]
@@ -449,7 +568,7 @@ start_server {tags {"defrag"}} {
                 }
 
                 # verify the data isn't corrupted or changed
-                set newdigest [r debug digest]
+                set newdigest [debug_digest]
                 assert {$digest eq $newdigest}
                 r save ;# saving an rdb iterates over all the data / pointers
             }

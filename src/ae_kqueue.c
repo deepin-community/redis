@@ -74,6 +74,7 @@ static int aeApiCreate(aeEventLoop *eventLoop) {
         zfree(state);
         return -1;
     }
+    anetCloexec(state->kqfd);
     state->eventsMask = zmalloc(EVENT_MASK_MALLOC_SIZE(eventLoop->setsize));
     memset(state->eventsMask, 0, EVENT_MASK_MALLOC_SIZE(eventLoop->setsize));
     eventLoop->apidata = state;
@@ -177,7 +178,10 @@ static int aeApiPoll(aeEventLoop *eventLoop, struct timeval *tvp) {
                 numevents++;
             }
         }
+    } else if (retval == -1 && errno != EINTR) {
+        panic("aeApiPoll: kevent, %s", strerror(errno));
     }
+
     return numevents;
 }
 

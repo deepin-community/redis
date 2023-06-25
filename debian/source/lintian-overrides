@@ -1,2 +1,4 @@
 # Upstream do not provide signed tarballs.
-redis source: debian-watch-does-not-check-gpg-signature
+redis source: debian-watch-does-not-check-openpgp-signature
+redis source: maintainer-manual-page
+redis source: very-long-line-length-in-source-file
