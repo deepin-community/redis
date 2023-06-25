@@ -269,9 +269,14 @@ list *listDup(list *orig)
                 listRelease(copy);
                 return NULL;
             }
-        } else
+        } else {
             value = node->value;
+        }
+        
         if (listAddNodeTail(copy, value) == NULL) {
+            /* Free value if dup succeed but listAddNodeTail failed. */
+            if (copy->free) copy->free(value);
+
             listRelease(copy);
             return NULL;
         }
@@ -360,15 +365,16 @@ void listRotateHeadToTail(list *list) {
 /* Add all the elements of the list 'o' at the end of the
  * list 'l'. The list 'other' remains empty but otherwise valid. */
 void listJoin(list *l, list *o) {
-    if (o->head)
-        o->head->prev = l->tail;
+    if (o->len == 0) return;
+
+    o->head->prev = l->tail;
 
     if (l->tail)
         l->tail->next = o->head;
     else
         l->head = o->head;
 
-    if (o->tail) l->tail = o->tail;
+    l->tail = o->tail;
     l->len += o->len;
 
     /* Setup other as an empty list. */

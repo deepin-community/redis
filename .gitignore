@@ -9,14 +9,14 @@ redis-benchmark
 redis-check-aof
 redis-check-rdb
 redis-check-dump
-redis-cli
 redis-sentinel
 redis-server
 doc-tools
 release
 misc/*
 src/release.h
-appendonly.aof
+appendonly.aof*
+appendonlydir
 SHORT_TERM_TODO
 release.h
 src/transfer.sh
@@ -27,6 +27,7 @@ src/nodes.conf
 deps/lua/src/lua
 deps/lua/src/luac
 deps/lua/src/liblua.a
+deps/hdr_histogram/libhdrhistogram.a
 tests/tls/*
 .make-*
 .prerequisites
@@ -37,3 +38,5 @@ Makefile.dep
 .ccls
 .ccls-cache/*
 compile_commands.json
+redis.code-workspace
+!bash_completion.d

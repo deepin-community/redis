@@ -3,6 +3,13 @@ set testmodule [file normalize tests/modules/commandfilter.so]
 start_server {tags {"modules"}} {
     r module load $testmodule log-key 0
 
+    test {Retain a command filter argument} {
+        # Retain an argument now. Later we'll try to re-read it and make sure
+        # it is not corrupt and that valgrind does not complain.
+        r rpush some-list @retain my-retained-string
+        r commandfilter.retained
+    } {my-retained-string}
+
     test {Command Filter handles redirected commands} {
         r set mykey @log
         r lrange log-key 0 -1
@@ -43,6 +50,10 @@ start_server {tags {"modules"}} {
         r lrange log-key 0 -1
     } "{ping @log}"
 
+    test {Command Filter strings can be retained} {
+        r commandfilter.retained
+    } {my-retained-string}
+
     test {Command Filter is unregistered implicitly on module unload} {
         r del log-key
         r module unload commandfilter
@@ -81,4 +92,27 @@ start_server {tags {"modules"}} {
         assert_equal {} [r lrange log-key 0 -1]
     }
 
+    test "Unload the module - commandfilter" {
+        assert_equal {OK} [r module unload commandfilter]
+    }
 } 
+
+test {RM_CommandFilterArgInsert and script argv caching} {
+    # coverage for scripts calling commands that expand the argv array
+    # an attempt to add coverage for a possible bug in luaArgsToRedisArgv
+    # this test needs a fresh server so that lua_argv_size is 0.
+    # glibc realloc can return the same pointer even when the size changes
+    # still this test isn't able to trigger the issue, but we keep it anyway.
+    start_server {tags {"modules"}} {
+        r module load $testmodule log-key 0
+        r del mylist
+        # command with 6 args
+        r eval {redis.call('rpush', KEYS[1], 'elem1', 'elem2', 'elem3', 'elem4')} 1 mylist
+        # command with 3 args that is changed to 4
+        r eval {redis.call('rpush', KEYS[1], '@insertafter')} 1 mylist
+        # command with 6 args again
+        r eval {redis.call('rpush', KEYS[1], 'elem1', 'elem2', 'elem3', 'elem4')} 1 mylist
+        assert_equal [r lrange mylist 0 -1] {elem1 elem2 elem3 elem4 @insertafter --inserted-after-- elem1 elem2 elem3 elem4}
+    }
+}
+

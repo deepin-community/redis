@@ -203,7 +203,7 @@ sds setTypeNextObject(setTypeIterator *si) {
  * The caller provides both pointers to be populated with the right
  * object. The return value of the function is the object->encoding
  * field of the object and is used by the caller to check if the
- * int64_t pointer or the redis object pointer was populated.
+ * int64_t pointer or the sds pointer was populated.
  *
  * Note that both the sdsele and llele pointers should be passed and cannot
  * be NULL since the function will try to defensively populate the non
@@ -242,7 +242,7 @@ void setTypeConvert(robj *setobj, int enc) {
 
     if (enc == OBJ_ENCODING_HT) {
         int64_t intele;
-        dict *d = dictCreate(&setDictType,NULL);
+        dict *d = dictCreate(&setDictType);
         sds element;
 
         /* Presize the dict to avoid rehashing */
@@ -264,19 +264,52 @@ void setTypeConvert(robj *setobj, int enc) {
     }
 }
 
+/* This is a helper function for the COPY command.
+ * Duplicate a set object, with the guarantee that the returned object
+ * has the same encoding as the original one.
+ *
+ * The resulting object always has refcount set to 1 */
+robj *setTypeDup(robj *o) {
+    robj *set;
+    setTypeIterator *si;
+    sds elesds;
+    int64_t intobj;
+
+    serverAssert(o->type == OBJ_SET);
+
+    /* Create a new set object that have the same encoding as the original object's encoding */
+    if (o->encoding == OBJ_ENCODING_INTSET) {
+        intset *is = o->ptr;
+        size_t size = intsetBlobLen(is);
+        intset *newis = zmalloc(size);
+        memcpy(newis,is,size);
+        set = createObject(OBJ_SET, newis);
+        set->encoding = OBJ_ENCODING_INTSET;
+    } else if (o->encoding == OBJ_ENCODING_HT) {
+        set = createSetObject();
+        dict *d = o->ptr;
+        dictExpand(set->ptr, dictSize(d));
+        si = setTypeInitIterator(o);
+        while (setTypeNext(si, &elesds, &intobj) != -1) {
+            setTypeAdd(set, elesds);
+        }
+        setTypeReleaseIterator(si);
+    } else {
+        serverPanic("Unknown set encoding");
+    }
+    return set;
+}
+
 void saddCommand(client *c) {
     robj *set;
     int j, added = 0;
 
     set = lookupKeyWrite(c->db,c->argv[1]);
+    if (checkType(c,set,OBJ_SET)) return;
+    
     if (set == NULL) {
         set = setTypeCreate(c->argv[2]->ptr);
         dbAdd(c->db,c->argv[1],set);
-    } else {
-        if (set->type != OBJ_SET) {
-            addReply(c,shared.wrongtypeerr);
-            return;
-        }
     }
 
     for (j = 2; j < c->argc; j++) {
@@ -333,7 +366,7 @@ void smoveCommand(client *c) {
     /* If the source key has the wrong type, or the destination key
      * is set and has the wrong type, return with an error. */
     if (checkType(c,srcset,OBJ_SET) ||
-        (dstset && checkType(c,dstset,OBJ_SET))) return;
+        checkType(c,dstset,OBJ_SET)) return;
 
     /* If srcset and dstset are equal, SMOVE is a no-op */
     if (srcset == dstset) {
@@ -385,6 +418,25 @@ void sismemberCommand(client *c) {
         addReply(c,shared.czero);
 }
 
+void smismemberCommand(client *c) {
+    robj *set;
+    int j;
+
+    /* Don't abort when the key cannot be found. Non-existing keys are empty
+     * sets, where SMISMEMBER should respond with a series of zeros. */
+    set = lookupKeyRead(c->db,c->argv[1]);
+    if (set && checkType(c,set,OBJ_SET)) return;
+
+    addReplyArrayLen(c,c->argc - 2);
+
+    for (j = 2; j < c->argc; j++) {
+        if (set && setTypeIsMember(set,c->argv[j]->ptr))
+            addReply(c,shared.cone);
+        else
+            addReply(c,shared.czero);
+    }
+}
+
 void scardCommand(client *c) {
     robj *o;
 
@@ -408,13 +460,8 @@ void spopWithCountCommand(client *c) {
     robj *set;
 
     /* Get the count argument */
-    if (getLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK) return;
-    if (l >= 0) {
-        count = (unsigned long) l;
-    } else {
-        addReply(c,shared.outofrangeerr);
-        return;
-    }
+    if (getPositiveLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK) return;
+    count = (unsigned long) l;
 
     /* Make sure a key with the name inputted exists, and that it's type is
      * indeed a set. Otherwise, return nil */
@@ -432,7 +479,7 @@ void spopWithCountCommand(client *c) {
 
     /* Generate an SPOP keyspace notification */
     notifyKeyspaceEvent(NOTIFY_SET,"spop",c->argv[1],c->db->id);
-    server.dirty += count;
+    server.dirty += (count >= size) ? size : count;
 
     /* CASE 1:
      * The number of requested elements is greater than or equal to
@@ -448,7 +495,6 @@ void spopWithCountCommand(client *c) {
         /* Propagate this command as a DEL operation */
         rewriteClientCommandVector(c,2,shared.del,c->argv[1]);
         signalModifiedKey(c,c->db,c->argv[1]);
-        server.dirty++;
         return;
     }
 
@@ -456,7 +502,7 @@ void spopWithCountCommand(client *c) {
      * Prepare our replication argument vector. Also send the array length
      * which is common to both the code paths. */
     robj *propargv[3];
-    propargv[0] = createStringObject("SREM",4);
+    propargv[0] = shared.srem;
     propargv[1] = c->argv[1];
     addReplySetLen(c,count);
 
@@ -490,8 +536,7 @@ void spopWithCountCommand(client *c) {
 
             /* Replicate/AOF this command as an SREM operation */
             propargv[2] = objele;
-            alsoPropagate(server.sremCommand,c->db->id,propargv,3,
-                PROPAGATE_AOF|PROPAGATE_REPL);
+            alsoPropagate(c->db->id,propargv,3,PROPAGATE_AOF|PROPAGATE_REPL);
             decrRefCount(objele);
         }
     } else {
@@ -533,8 +578,7 @@ void spopWithCountCommand(client *c) {
 
             /* Replicate/AOF this command as an SREM operation */
             propargv[2] = objele;
-            alsoPropagate(server.sremCommand,c->db->id,propargv,3,
-                PROPAGATE_AOF|PROPAGATE_REPL);
+            alsoPropagate(c->db->id,propargv,3,PROPAGATE_AOF|PROPAGATE_REPL);
             decrRefCount(objele);
         }
         setTypeReleaseIterator(si);
@@ -547,14 +591,12 @@ void spopWithCountCommand(client *c) {
      * dirty counter. We don't want to propagate an SPOP command since
      * we propagated the command as a set of SREMs operations using
      * the alsoPropagate() API. */
-    decrRefCount(propargv[0]);
     preventCommandPropagation(c);
     signalModifiedKey(c,c->db,c->argv[1]);
-    server.dirty++;
 }
 
 void spopCommand(client *c) {
-    robj *set, *ele, *aux;
+    robj *set, *ele;
     sds sdsele;
     int64_t llele;
     int encoding;
@@ -563,7 +605,7 @@ void spopCommand(client *c) {
         spopWithCountCommand(c);
         return;
     } else if (c->argc > 3) {
-        addReply(c,shared.syntaxerr);
+        addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
@@ -587,9 +629,7 @@ void spopCommand(client *c) {
     notifyKeyspaceEvent(NOTIFY_SET,"spop",c->argv[1],c->db->id);
 
     /* Replicate/AOF this command as an SREM operation */
-    aux = createStringObject("SREM",4);
-    rewriteClientCommandVector(c,3,aux,c->argv[1],ele);
-    decrRefCount(aux);
+    rewriteClientCommandVector(c,3,shared.srem,c->argv[1],ele);
 
     /* Add the element to the reply */
     addReplyBulk(c,ele);
@@ -625,7 +665,7 @@ void srandmemberWithCountCommand(client *c) {
 
     dict *d;
 
-    if (getLongFromObjectOrReply(c,c->argv[2],&l,NULL) != C_OK) return;
+    if (getRangeLongFromObjectOrReply(c,c->argv[2],-LONG_MAX,LONG_MAX,&l,NULL) != C_OK) return;
     if (l >= 0) {
         count = (unsigned long) l;
     } else {
@@ -635,22 +675,23 @@ void srandmemberWithCountCommand(client *c) {
         uniq = 0;
     }
 
-    if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.emptyset[c->resp]))
+    if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.emptyarray))
         == NULL || checkType(c,set,OBJ_SET)) return;
     size = setTypeSize(set);
 
     /* If count is zero, serve it ASAP to avoid special cases later. */
     if (count == 0) {
-        addReply(c,shared.emptyset[c->resp]);
+        addReply(c,shared.emptyarray);
         return;
     }
 
     /* CASE 1: The count was negative, so the extraction method is just:
      * "return N random elements" sampling the whole set every time.
      * This case is trivial and can be served without auxiliary data
-     * structures. */
-    if (!uniq) {
-        addReplySetLen(c,count);
+     * structures. This case is the only one that also needs to return the
+     * elements in random order. */
+    if (!uniq || count == 1) {
+        addReplyArrayLen(c,count);
         while(count--) {
             encoding = setTypeRandomElement(set,&ele,&llele);
             if (encoding == OBJ_ENCODING_INTSET) {
@@ -658,6 +699,8 @@ void srandmemberWithCountCommand(client *c) {
             } else {
                 addReplyBulkCBuffer(c,ele,sdslen(ele));
             }
+            if (c->flags & CLIENT_CLOSE_ASAP)
+                break;
         }
         return;
     }
@@ -666,12 +709,24 @@ void srandmemberWithCountCommand(client *c) {
      * The number of requested elements is greater than the number of
      * elements inside the set: simply return the whole set. */
     if (count >= size) {
-        sunionDiffGenericCommand(c,c->argv+1,1,NULL,SET_OP_UNION);
+        setTypeIterator *si;
+        addReplyArrayLen(c,size);
+        si = setTypeInitIterator(set);
+        while ((encoding = setTypeNext(si,&ele,&llele)) != -1) {
+            if (encoding == OBJ_ENCODING_INTSET) {
+                addReplyBulkLongLong(c,llele);
+            } else {
+                addReplyBulkCBuffer(c,ele,sdslen(ele));
+            }
+            size--;
+        }
+        setTypeReleaseIterator(si);
+        serverAssert(size==0);
         return;
     }
 
     /* For CASE 3 and CASE 4 we need an auxiliary dictionary. */
-    d = dictCreate(&objectKeyPointerValueDictType,NULL);
+    d = dictCreate(&sdsReplyDictType);
 
     /* CASE 3:
      * The number of elements inside the set is not greater than
@@ -681,19 +736,20 @@ void srandmemberWithCountCommand(client *c) {
      *
      * This is done because if the number of requested elements is just
      * a bit less than the number of elements in the set, the natural approach
-     * used into CASE 3 is highly inefficient. */
+     * used into CASE 4 is highly inefficient. */
     if (count*SRANDMEMBER_SUB_STRATEGY_MUL > size) {
         setTypeIterator *si;
 
         /* Add all the elements into the temporary dictionary. */
         si = setTypeInitIterator(set);
-        while((encoding = setTypeNext(si,&ele,&llele)) != -1) {
+        dictExpand(d, size);
+        while ((encoding = setTypeNext(si,&ele,&llele)) != -1) {
             int retval = DICT_ERR;
 
             if (encoding == OBJ_ENCODING_INTSET) {
-                retval = dictAdd(d,createStringObjectFromLongLong(llele),NULL);
+                retval = dictAdd(d,sdsfromlonglong(llele),NULL);
             } else {
-                retval = dictAdd(d,createStringObject(ele,sdslen(ele)),NULL);
+                retval = dictAdd(d,sdsdup(ele),NULL);
             }
             serverAssert(retval == DICT_OK);
         }
@@ -701,11 +757,12 @@ void srandmemberWithCountCommand(client *c) {
         serverAssert(dictSize(d) == size);
 
         /* Remove random elements to reach the right count. */
-        while(size > count) {
+        while (size > count) {
             dictEntry *de;
-
-            de = dictGetRandomKey(d);
-            dictDelete(d,dictGetKey(de));
+            de = dictGetFairRandomKey(d);
+            dictUnlink(d,dictGetKey(de));
+            sdsfree(dictGetKey(de));
+            dictFreeUnlinkedEntry(d,de);
             size--;
         }
     }
@@ -716,22 +773,23 @@ void srandmemberWithCountCommand(client *c) {
      * to reach the specified count. */
     else {
         unsigned long added = 0;
-        robj *objele;
+        sds sdsele;
 
-        while(added < count) {
+        dictExpand(d, count);
+        while (added < count) {
             encoding = setTypeRandomElement(set,&ele,&llele);
             if (encoding == OBJ_ENCODING_INTSET) {
-                objele = createStringObjectFromLongLong(llele);
+                sdsele = sdsfromlonglong(llele);
             } else {
-                objele = createStringObject(ele,sdslen(ele));
+                sdsele = sdsdup(ele);
             }
             /* Try to add the object to the dictionary. If it already exists
              * free it, otherwise increment the number of objects we have
              * in the result dictionary. */
-            if (dictAdd(d,objele,NULL) == DICT_OK)
+            if (dictAdd(d,sdsele,NULL) == DICT_OK)
                 added++;
             else
-                decrRefCount(objele);
+                sdsfree(sdsele);
         }
     }
 
@@ -740,15 +798,16 @@ void srandmemberWithCountCommand(client *c) {
         dictIterator *di;
         dictEntry *de;
 
-        addReplySetLen(c,count);
+        addReplyArrayLen(c,count);
         di = dictGetIterator(d);
         while((de = dictNext(di)) != NULL)
-            addReplyBulk(c,dictGetKey(de));
+            addReplyBulkSds(c,dictGetKey(de));
         dictReleaseIterator(di);
         dictRelease(d);
     }
 }
 
+/* SRANDMEMBER <key> [<count>] */
 void srandmemberCommand(client *c) {
     robj *set;
     sds ele;
@@ -759,10 +818,11 @@ void srandmemberCommand(client *c) {
         srandmemberWithCountCommand(c);
         return;
     } else if (c->argc > 3) {
-        addReply(c,shared.syntaxerr);
+        addReplyErrorObject(c,shared.syntaxerr);
         return;
     }
 
+    /* Handle variant without <count> argument. Reply with simple bulk string */
     if ((set = lookupKeyReadOrReply(c,c->argv[1],shared.null[c->resp]))
         == NULL || checkType(c,set,OBJ_SET)) return;
 
@@ -792,8 +852,17 @@ int qsortCompareSetsByRevCardinality(const void *s1, const void *s2) {
     return 0;
 }
 
+/* SINTER / SMEMBERS / SINTERSTORE / SINTERCARD
+ *
+ * 'cardinality_only' work for SINTERCARD, only return the cardinality
+ * with minimum processing and memory overheads.
+ *
+ * 'limit' work for SINTERCARD, stop searching after reaching the limit.
+ * Passing a 0 means unlimited.
+ */
 void sinterGenericCommand(client *c, robj **setkeys,
-                          unsigned long setnum, robj *dstkey) {
+                          unsigned long setnum, robj *dstkey,
+                          int cardinality_only, unsigned long limit) {
     robj **sets = zmalloc(sizeof(robj*)*setnum);
     setTypeIterator *si;
     robj *dstset = NULL;
@@ -804,9 +873,7 @@ void sinterGenericCommand(client *c, robj **setkeys,
     int encoding, empty = 0;
 
     for (j = 0; j < setnum; j++) {
-        robj *setobj = dstkey ?
-            lookupKeyWrite(c->db,setkeys[j]) :
-            lookupKeyRead(c->db,setkeys[j]);
+        robj *setobj = lookupKeyRead(c->db, setkeys[j]);
         if (!setobj) {
             /* A NULL is considered an empty set */
             empty += 1;
@@ -831,6 +898,8 @@ void sinterGenericCommand(client *c, robj **setkeys,
                 server.dirty++;
             }
             addReply(c,shared.czero);
+        } else if (cardinality_only) {
+            addReplyLongLong(c,cardinality);
         } else {
             addReply(c,shared.emptyset[c->resp]);
         }
@@ -846,12 +915,12 @@ void sinterGenericCommand(client *c, robj **setkeys,
      * the intersection set size, so we use a trick, append an empty object
      * to the output list and save the pointer to later modify it with the
      * right length */
-    if (!dstkey) {
-        replylen = addReplyDeferredLen(c);
-    } else {
+    if (dstkey) {
         /* If we have a target key where to store the resulting set
          * create this key with an empty set inside */
         dstset = createIntsetObject();
+    } else if (!cardinality_only) {
+        replylen = addReplyDeferredLen(c);
     }
 
     /* Iterate all the elements of the first (smallest) set, and test
@@ -887,7 +956,13 @@ void sinterGenericCommand(client *c, robj **setkeys,
 
         /* Only take action when all sets contain the member */
         if (j == setnum) {
-            if (!dstkey) {
+            if (cardinality_only) {
+                cardinality++;
+
+                /* We stop the searching after reaching the limit. */
+                if (limit && cardinality >= limit)
+                    break;
+            } else if (!dstkey) {
                 if (encoding == OBJ_ENCODING_HT)
                     addReplyBulkCBuffer(c,elesds,sdslen(elesds));
                 else
@@ -906,24 +981,26 @@ void sinterGenericCommand(client *c, robj **setkeys,
     }
     setTypeReleaseIterator(si);
 
-    if (dstkey) {
+    if (cardinality_only) {
+        addReplyLongLong(c,cardinality);
+    } else if (dstkey) {
         /* Store the resulting set into the target, if the intersection
          * is not an empty set. */
-        int deleted = dbDelete(c->db,dstkey);
         if (setTypeSize(dstset) > 0) {
-            dbAdd(c->db,dstkey,dstset);
+            setKey(c,c->db,dstkey,dstset,0);
             addReplyLongLong(c,setTypeSize(dstset));
             notifyKeyspaceEvent(NOTIFY_SET,"sinterstore",
                 dstkey,c->db->id);
+            server.dirty++;
         } else {
-            decrRefCount(dstset);
             addReply(c,shared.czero);
-            if (deleted)
-                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
-                    dstkey,c->db->id);
+            if (dbDelete(c->db,dstkey)) {
+                server.dirty++;
+                signalModifiedKey(c,c->db,dstkey);
+                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",dstkey,c->db->id);
+            }
         }
-        signalModifiedKey(c,c->db,dstkey);
-        server.dirty++;
+        decrRefCount(dstset);
     } else {
         setDeferredSetLen(c,replylen,cardinality);
     }
@@ -932,17 +1009,45 @@ void sinterGenericCommand(client *c, robj **setkeys,
 
 /* SINTER key [key ...] */
 void sinterCommand(client *c) {
-    sinterGenericCommand(c,c->argv+1,c->argc-1,NULL);
+    sinterGenericCommand(c, c->argv+1,  c->argc-1, NULL, 0, 0);
+}
+
+/* SINTERCARD numkeys key [key ...] [LIMIT limit] */
+void sinterCardCommand(client *c) {
+    long j;
+    long numkeys = 0; /* Number of keys. */
+    long limit = 0;   /* 0 means not limit. */
+
+    if (getRangeLongFromObjectOrReply(c, c->argv[1], 1, LONG_MAX,
+                                      &numkeys, "numkeys should be greater than 0") != C_OK)
+        return;
+    if (numkeys > (c->argc - 2)) {
+        addReplyError(c, "Number of keys can't be greater than number of args");
+        return;
+    }
+
+    for (j = 2 + numkeys; j < c->argc; j++) {
+        char *opt = c->argv[j]->ptr;
+        int moreargs = (c->argc - 1) - j;
+
+        if (!strcasecmp(opt, "LIMIT") && moreargs) {
+            j++;
+            if (getPositiveLongFromObjectOrReply(c, c->argv[j], &limit,
+                                                 "LIMIT can't be negative") != C_OK)
+                return;
+        } else {
+            addReplyErrorObject(c, shared.syntaxerr);
+            return;
+        }
+    }
+
+    sinterGenericCommand(c, c->argv+2, numkeys, NULL, 1, limit);
 }
 
 /* SINTERSTORE destination key [key ...] */
 void sinterstoreCommand(client *c) {
-    sinterGenericCommand(c,c->argv+2,c->argc-2,c->argv[1]);
+    sinterGenericCommand(c, c->argv+2, c->argc-2, c->argv[1], 0, 0);
 }
-
-#define SET_OP_UNION 0
-#define SET_OP_DIFF 1
-#define SET_OP_INTER 2
 
 void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
                               robj *dstkey, int op) {
@@ -952,11 +1057,10 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
     sds ele;
     int j, cardinality = 0;
     int diff_algo = 1;
+    int sameset = 0; 
 
     for (j = 0; j < setnum; j++) {
-        robj *setobj = dstkey ?
-            lookupKeyWrite(c->db,setkeys[j]) :
-            lookupKeyRead(c->db,setkeys[j]);
+        robj *setobj = lookupKeyRead(c->db, setkeys[j]);
         if (!setobj) {
             sets[j] = NULL;
             continue;
@@ -966,6 +1070,9 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
             return;
         }
         sets[j] = setobj;
+        if (j > 0 && sets[0] == sets[j]) {
+            sameset = 1; 
+        }
     }
 
     /* Select what DIFF algorithm to use.
@@ -977,7 +1084,7 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
      * the sets.
      *
      * We compute what is the best bet with the current input here. */
-    if (op == SET_OP_DIFF && sets[0]) {
+    if (op == SET_OP_DIFF && sets[0] && !sameset) {
         long long algo_one_work = 0, algo_two_work = 0;
 
         for (j = 0; j < setnum; j++) {
@@ -1019,6 +1126,8 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
             }
             setTypeReleaseIterator(si);
         }
+    } else if (op == SET_OP_DIFF && sameset) {
+        /* At least one of the sets is the same one (same key) as the first one, result must be empty. */
     } else if (op == SET_OP_DIFF && sets[0] && diff_algo == 1) {
         /* DIFF Algorithm 1:
          *
@@ -1080,27 +1189,27 @@ void sunionDiffGenericCommand(client *c, robj **setkeys, int setnum,
             sdsfree(ele);
         }
         setTypeReleaseIterator(si);
-        server.lazyfree_lazy_server_del ? freeObjAsync(dstset) :
+        server.lazyfree_lazy_server_del ? freeObjAsync(NULL, dstset, -1) :
                                           decrRefCount(dstset);
     } else {
         /* If we have a target key where to store the resulting set
          * create this key with the result set inside */
-        int deleted = dbDelete(c->db,dstkey);
         if (setTypeSize(dstset) > 0) {
-            dbAdd(c->db,dstkey,dstset);
+            setKey(c,c->db,dstkey,dstset,0);
             addReplyLongLong(c,setTypeSize(dstset));
             notifyKeyspaceEvent(NOTIFY_SET,
                 op == SET_OP_UNION ? "sunionstore" : "sdiffstore",
                 dstkey,c->db->id);
+            server.dirty++;
         } else {
-            decrRefCount(dstset);
             addReply(c,shared.czero);
-            if (deleted)
-                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",
-                    dstkey,c->db->id);
+            if (dbDelete(c->db,dstkey)) {
+                server.dirty++;
+                signalModifiedKey(c,c->db,dstkey);
+                notifyKeyspaceEvent(NOTIFY_GENERIC,"del",dstkey,c->db->id);
+            }
         }
-        signalModifiedKey(c,c->db,dstkey);
-        server.dirty++;
+        decrRefCount(dstset);
     }
     zfree(sets);
 }

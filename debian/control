@@ -18,9 +18,9 @@ Build-Depends:
  procps <!nocheck>,
  tcl <!nocheck>,
  tcl-tls <!nocheck>,
-Standards-Version: 4.6.0
+Standards-Version: 4.6.2
 Homepage: https://redis.io/
-Vcs-Git: https://salsa.debian.org/lamby/pkg-redis.git -b debian/sid
+Vcs-Git: https://salsa.debian.org/lamby/pkg-redis.git -b debian/experimental
 Vcs-Browser: https://salsa.debian.org/lamby/pkg-redis
 Rules-Requires-Root: no
 
@@ -37,7 +37,7 @@ Description: Persistent key-value database with network interface (metapackage)
  .
  The dataset is stored entirely in memory and periodically flushed to disk.
  .
- This package installs the main redis-server package.
+ This package depends on the redis-server package.
 
 Package: redis-sentinel
 Architecture: any

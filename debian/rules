@@ -1,24 +1,13 @@
 #!/usr/bin/make -f
 
+DPKG_EXPORT_BUILDFLAGS = 1
 include /usr/share/dpkg/buildflags.mk
-
-# Try and use these Lua modules shipped in Debian...
-LUA_LIBS_DEBIAN = cjson bitop
-
-# ... which are not always called their "C" names
-LUA_LIBS_DEBIAN_NAMES = cjson bit
-
-# ... but fallback to these currently unpackaged ones.
-LUA_LIBS_BUNDLED = struct cmsgpack
-
-LUA_OBJECTS = $(addprefix lua_,$(addsuffix .o,$(LUA_LIBS_BUNDLED)))
-LUA_LDFLAGS = $(addprefix -llua5.1-,$(LUA_LIBS_DEBIAN)) $(addprefix ../deps/lua/src/,$(LUA_OBJECTS))
 
 export BUILD_TLS = yes
 export CFLAGS CPPFLAGS LDFLAGS
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 export DEB_CFLAGS_MAINT_APPEND = -I/usr/include/liblzf
-export DEB_LDFLAGS_MAINT_APPEND = -Wl,-no-as-needed -ldl -latomic -llzf $(LUA_LDFLAGS)
+export DEB_LDFLAGS_MAINT_APPEND = -Wl,-no-as-needed -ldl -latomic -llzf
 
 # Build jemelloc in parallel
 ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
@@ -30,33 +19,20 @@ endif
 %:
 	dh $@
 
-debian/lua_libs_debian.c:
-	echo "// Automatically generated; do not edit." >$@
-	echo "luaLoadLib(lua, LUA_LOADLIBNAME, luaopen_package);" >>$@
-	set -e; for X in $(LUA_LIBS_DEBIAN_NAMES); do \
-		echo "if (luaL_dostring(lua, \"$$X = require('$$X');\"))" >>$@; \
-		echo "    serverLog(LL_NOTICE, \"Error loading $$X library\");" >>$@; \
-	done
-	echo 'luaL_dostring(lua, "module = nil; require = nil;");' >>$@
-
 override_dh_auto_clean:
 	dh_auto_clean
-	rm -f src/release.h debian/*.service debian/lua_libs_debian.c
+	rm -f src/release.h debian/*.service
 
-override_dh_auto_build: debian/lua_libs_debian.c
-	# Build the non-bundled Lua libraries
-	dh_auto_build --sourcedirectory=deps/lua/src -- $(LUA_OBJECTS)
-	
-	dh_auto_build --parallel -- V=1 USE_SYSTEM_JEMALLOC=yes USE_SYSTEM_LUA=yes USE_SYSTEM_HIREDIS=no USE_SYSTEMD=yes
+override_dh_auto_build:
+	dh_auto_build -- V=1 USE_SYSTEM_JEMALLOC=yes USE_SYSTEMD=yes USE_JEMALLOC=yes
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
-	# Avoid race conditions in upstream testsuite.
 	# Generate a root CA and server certificate for testing
 	./utils/gen-test-certs.sh
 	# Avoid race conditions in upstream testsuite
-	./runtest --clients 1 --tls || true
-	./runtest-cluster --tls || true
+	./runtest --clients 1 --verbose --dump-logs --tls || true
+	timeout 30m ./runtest-cluster --tls || true
 	./runtest-sentinel || true
 endif
 

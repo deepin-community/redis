@@ -108,19 +108,52 @@ void rioInitWithBuffer(rio *r, sds s) {
 
 /* Returns 1 or 0 for success/failure. */
 static size_t rioFileWrite(rio *r, const void *buf, size_t len) {
-    size_t retval;
+    if (!r->io.file.autosync) return fwrite(buf,len,1,r->io.file.fp);
 
-    retval = fwrite(buf,len,1,r->io.file.fp);
-    r->io.file.buffered += len;
+    size_t nwritten = 0;
+    /* Incrementally write data to the file, avoid a single write larger than
+     * the autosync threshold (so that the kernel's buffer cache never has too
+     * many dirty pages at once). */
+    while (len != nwritten) {
+        serverAssert(r->io.file.autosync > r->io.file.buffered);
+        size_t nalign = (size_t)(r->io.file.autosync - r->io.file.buffered);
+        size_t towrite = nalign > len-nwritten ? len-nwritten : nalign;
 
-    if (r->io.file.autosync &&
-        r->io.file.buffered >= r->io.file.autosync)
-    {
-        fflush(r->io.file.fp);
-        redis_fsync(fileno(r->io.file.fp));
-        r->io.file.buffered = 0;
+        if (fwrite((char*)buf+nwritten,towrite,1,r->io.file.fp) == 0) return 0;
+        nwritten += towrite;
+        r->io.file.buffered += towrite;
+
+        if (r->io.file.buffered >= r->io.file.autosync) {
+            fflush(r->io.file.fp);
+
+            size_t processed = r->processed_bytes + nwritten;
+            serverAssert(processed % r->io.file.autosync == 0);
+            serverAssert(r->io.file.buffered == r->io.file.autosync);
+
+#if HAVE_SYNC_FILE_RANGE
+            /* Start writeout asynchronously. */
+            if (sync_file_range(fileno(r->io.file.fp),
+                    processed - r->io.file.autosync, r->io.file.autosync,
+                    SYNC_FILE_RANGE_WRITE) == -1)
+                return 0;
+
+            if (processed >= (size_t)r->io.file.autosync * 2) {
+                /* To keep the promise to 'autosync', we should make sure last
+                 * asynchronous writeout persists into disk. This call may block
+                 * if last writeout is not finished since disk is slow. */
+                if (sync_file_range(fileno(r->io.file.fp),
+                        processed - r->io.file.autosync*2,
+                        r->io.file.autosync, SYNC_FILE_RANGE_WAIT_BEFORE|
+                        SYNC_FILE_RANGE_WRITE|SYNC_FILE_RANGE_WAIT_AFTER) == -1)
+                    return 0;
+            }
+#else
+            if (redis_fsync(fileno(r->io.file.fp)) == -1) return 0;
+#endif
+            r->io.file.buffered = 0;
+        }
     }
-    return retval;
+    return 1;
 }
 
 /* Returns 1 or 0 for success/failure. */
@@ -160,7 +193,7 @@ void rioInitWithFile(rio *r, FILE *fp) {
 }
 
 /* ------------------- Connection implementation -------------------
- * We use this RIO implemetnation when reading an RDB file directly from
+ * We use this RIO implementation when reading an RDB file directly from
  * the connection to the memory via rdbLoadRio(), thus this implementation
  * only implements reading from a connection that is, normally,
  * just a socket. */
@@ -211,7 +244,10 @@ static size_t rioConnRead(rio *r, void *buf, size_t len) {
         int retval = connRead(r->io.conn.conn,
                           (char*)r->io.conn.buf + sdslen(r->io.conn.buf),
                           toread);
-        if (retval <= 0) {
+        if (retval == 0) {
+            return 0;
+        } else if (retval < 0) {
+            if (connLastErrorRetryable(r->io.conn.conn)) continue;
             if (errno == EWOULDBLOCK) errno = ETIMEDOUT;
             return 0;
         }
@@ -262,7 +298,7 @@ void rioInitWithConn(rio *r, connection *conn, size_t read_limit) {
     sdsclear(r->io.conn.buf);
 }
 
-/* Release the RIO tream. Optionally returns the unread buffered data
+/* Release the RIO stream. Optionally returns the unread buffered data
  * when the SDS pointer 'remaining' is passed. */
 void rioFreeConn(rio *r, sds *remaining) {
     if (remaining && (size_t)r->io.conn.pos < sdslen(r->io.conn.buf)) {
@@ -310,7 +346,7 @@ static size_t rioFdWrite(rio *r, const void *buf, size_t len) {
             if (!doflush)
                 return 1;
         }
-        /* Flusing the buffered data. set 'p' and 'len' accordintly. */
+        /* Flushing the buffered data. set 'p' and 'len' accordingly. */
         p = (unsigned char*) r->io.fd.buf;
         len = sdslen(r->io.fd.buf);
     }
@@ -319,6 +355,7 @@ static size_t rioFdWrite(rio *r, const void *buf, size_t len) {
     while(nwritten != len) {
         retval = write(r->io.fd.fd,p+nwritten,len-nwritten);
         if (retval <= 0) {
+            if (retval == -1 && errno == EINTR) continue;
             /* With blocking io, which is the sole user of this
              * rio target, EWOULDBLOCK is returned only because of
              * the SO_SNDTIMEO socket option, so we translate the error
@@ -399,6 +436,20 @@ void rioGenericUpdateChecksum(rio *r, const void *buf, size_t len) {
 void rioSetAutoSync(rio *r, off_t bytes) {
     if(r->write != rioFileIO.write) return;
     r->io.file.autosync = bytes;
+}
+
+/* Check the type of rio. */
+uint8_t rioCheckType(rio *r) {
+    if (r->read == rioFileRead) {
+        return RIO_TYPE_FILE;
+    } else if (r->read == rioBufferRead) {
+        return RIO_TYPE_BUFFER;
+    } else if (r->read == rioConnRead) {
+        return RIO_TYPE_CONN;
+    } else {
+        /* r->read == rioFdRead */
+        return RIO_TYPE_FD;
+    }
 }
 
 /* --------------------------- Higher level interface --------------------------

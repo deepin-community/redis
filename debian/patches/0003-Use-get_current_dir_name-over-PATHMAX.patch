@@ -1,0 +1,53 @@
+From: Chris Lamb <lamby@debian.org>
+Date: Wed, 24 Jan 2018 22:06:35 +1100
+Subject: Use get_current_dir_name over PATHMAX, etc.
+
+---
+ src/rdb.c | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/src/rdb.c b/src/rdb.c
+index 7a6ef88..bb9c6e7 100644
+--- a/src/rdb.c
++++ b/src/rdb.c
+@@ -1392,7 +1392,6 @@ werr: /* Write error. */
+ /* Save the DB on disk. Return C_ERR on error, C_OK on success. */
+ int rdbSave(int req, char *filename, rdbSaveInfo *rsi) {
+     char tmpfile[256];
+-    char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
+     FILE *fp = NULL;
+     rio rdb;
+     int error = 0;
+@@ -1402,13 +1401,14 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi) {
+     fp = fopen(tmpfile,"w");
+     if (!fp) {
+         char *str_err = strerror(errno);
+-        char *cwdp = getcwd(cwd,MAXPATHLEN);
++        char *cwdp = get_current_dir_name();
+         serverLog(LL_WARNING,
+             "Failed opening the temp RDB file %s (in server root dir %s) "
+             "for saving: %s",
+             tmpfile,
+             cwdp ? cwdp : "unknown",
+             str_err);
++        zfree(cwdp);
+         return C_ERR;
+     }
+ 
+@@ -1434,7 +1434,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi) {
+      * if the generate DB file is ok. */
+     if (rename(tmpfile,filename) == -1) {
+         char *str_err = strerror(errno);
+-        char *cwdp = getcwd(cwd,MAXPATHLEN);
++        char *cwdp = get_current_dir_name();
+         serverLog(LL_WARNING,
+             "Error moving temp DB file %s on the final "
+             "destination %s (in server root dir %s): %s",
+@@ -1444,6 +1444,7 @@ int rdbSave(int req, char *filename, rdbSaveInfo *rsi) {
+             str_err);
+         unlink(tmpfile);
+         stopSaving(0);
++        zfree(cwdp);
+         return C_ERR;
+     }
+     if (fsyncFileDir(filename) == -1) { err_op = "fsyncFileDir"; goto werr; }
