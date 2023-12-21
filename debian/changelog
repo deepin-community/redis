@@ -1,3 +1,79 @@
+redis (5:7.0.14-2) unstable; urgency=medium
+
+  * Drop ProcSubset=pid hardening flag from the systemd unit files it appears
+    to cause crashes with memory allocation errors. A huge thanks to Arnaud
+    Rebillout <arnaudr@kali.org> for the extensive investigation.
+    (Closes: #1055039)
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 31 Oct 2023 16:34:25 +0100
+
+redis (5:7.0.14-1) unstable; urgency=high
+
+  * New upstream security release:
+
+    - CVE-2023-45145: On startup, Redis began listening on a Unix socket before
+      adjusting its permissions to the user-provided configuration. If a
+      permissive umask(2) was used, this created a race condition that enabled,
+      during a short period of time, another process to establish an otherwise
+      unauthorized connection. (Closes: #1054225)
+
+  * Refresh patches.
+
+ -- Chris Lamb <lamby@debian.org>  Thu, 19 Oct 2023 15:50:56 +0100
+
+redis (5:7.0.13-2) unstable; urgency=medium
+
+  * Only install systemd units once. Thanks, Helmut Grohne. (Closes: #1054091)
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 17 Oct 2023 11:15:21 +0100
+
+redis (5:7.0.13-1) unstable; urgency=high
+
+  * New upstream security release:
+
+    - CVE-2023-41053: Redis did not correctly identify keys accessed by
+      `SORT_RO`, and as a result Redis may grant users executing this command
+      access to keys that are not explicitly authorized by the ACL
+      configuration. (Closes: #1051512)
+
+    <https://raw.githubusercontent.com/redis/redis/7.2/00-RELEASENOTES>
+
+  * Refresh patches.
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 08 Sep 2023 14:04:13 -0700
+
+redis (5:7.0.12-2) unstable; urgency=medium
+
+  * Try and clean up better. (Closes: #1047506)
+  * Allow arm64 crossbuild to run but not to fail the build if, for
+    instance, build-dependencies cannot be satisfied.
+  * Replace dependency on lsb-base with sysvinit-utils.
+  * Drop very debian/NEWS entry.
+
+ -- Chris Lamb <lamby@debian.org>  Thu, 24 Aug 2023 10:33:48 -0700
+
+redis (5:7.0.12-1) unstable; urgency=high
+
+  * New upstream security release:
+
+    - CVE-2022-24834: A specially-crafted Lua script executing in Redis could
+      have triggered a heap overflow in the cjson and cmsgpack libraries and
+      result in heap corruption and potentially remote code execution. The
+      problem exists in all versions of Redis with Lua scripting support and
+      affects only authenticated/authorised users.
+
+    - CVE-2023-36824: Extracting key names from a command and a list of
+      arguments may, in some cases, have triggered a heap overflow and result
+      in reading random heap memory, heap corruption and potentially remote
+      code execution. (Specifically using COMMAND GETKEYS* and validation of
+      key names in ACL rules). (Closes: #1040879)
+
+    For more information, please see:
+
+      <https://raw.githubusercontent.com/redis/redis/7.0/00-RELEASENOTES>
+
+ -- Chris Lamb <lamby@debian.org>  Wed, 12 Jul 2023 10:07:09 +0100
+
 redis (5:7.0.11-1) unstable; urgency=high
 
   * New upstream security release:

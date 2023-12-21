@@ -14,10 +14,10 @@ Forwarded: https://github.com/antirez/redis/pull/5279
  7 files changed, 34 insertions(+)
 
 diff --git a/deps/Makefile b/deps/Makefile
-index 8592e17..8478400 100644
+index 83ac557..5542a6c 100644
 --- a/deps/Makefile
 +++ b/deps/Makefile
-@@ -38,7 +38,9 @@ distclean:
+@@ -39,7 +39,9 @@ distclean:
  	-(cd hiredis && $(MAKE) clean) > /dev/null || true
  	-(cd linenoise && $(MAKE) clean) > /dev/null || true
  	-(cd lua && $(MAKE) clean) > /dev/null || true
@@ -48,7 +48,7 @@ index 391fdbc..4d81df9 100644
  ifeq ($(BUILD_TLS),yes)
  	FINAL_CFLAGS+=-DUSE_OPENSSL $(OPENSSL_CFLAGS)
 diff --git a/src/debug.c b/src/debug.c
-index 38ee6fb..879f845 100644
+index dffa986..294d46f 100644
 --- a/src/debug.c
 +++ b/src/debug.c
 @@ -72,6 +72,10 @@ void printCrashReport(void);

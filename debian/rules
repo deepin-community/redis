@@ -34,6 +34,10 @@ ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
 	./runtest --clients 1 --verbose --dump-logs --tls || true
 	timeout 30m ./runtest-cluster --tls || true
 	./runtest-sentinel || true
+	# Clean up after gen-test-certs.sh
+	rm -rf tests/tls || true
+	# Other cleanup
+	find tests/tmp ! -name .gitignore -type f -exec rm -rfv {} +
 endif
 
 override_dh_auto_install:

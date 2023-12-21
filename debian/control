@@ -44,8 +44,8 @@ Architecture: any
 Pre-Depends:
  ${misc:Pre-Depends},
 Depends:
- lsb-base (>= 3.2-14),
  redis-tools (= ${binary:Version}),
+ sysvinit-utils,
  ${misc:Depends},
 Description: Persistent key-value database with network interface (monitoring)
  Redis is a key-value database in a similar vein to memcache but the dataset
@@ -59,8 +59,8 @@ Architecture: any
 Pre-Depends:
  ${misc:Pre-Depends},
 Depends:
- lsb-base (>= 3.2-14),
  redis-tools (= ${binary:Version}),
+ sysvinit-utils,
  ${misc:Depends},
 Description: Persistent key-value database with network interface
  Redis is a key-value database in a similar vein to memcache but the dataset
