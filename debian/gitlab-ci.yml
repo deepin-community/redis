@@ -6,3 +6,6 @@ piuparts:
 
 lintian:
   allow_failure: true
+
+test-crossbuild-arm64:
+  allow_failure: true

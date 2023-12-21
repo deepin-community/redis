@@ -96,7 +96,6 @@ LockPersonality=true
 MemoryDenyWriteExecute=true
 NoNewPrivileges=true
 PrivateUsers=true
-ProcSubset=pid
 ProtectClock=true
 ProtectControlGroups=true
 ProtectHostname=true

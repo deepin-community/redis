@@ -13,6 +13,71 @@ SECURITY: There are security fixes in the release.
 
 
 ================================================================================
+Redis 7.0.14    Released Wed 18 Oct 2023 10:33:40 IDT
+================================================================================
+
+Upgrade urgency SECURITY: See security fixes below.
+
+Security fixes
+==============
+
+* (CVE-2023-45145) The wrong order of listen(2) and chmod(2) calls creates a
+  race condition that can be used by another process to bypass desired Unix
+  socket permissions on startup.
+
+
+================================================================================
+Redis 7.0.13    Released Wed 06 Sep 2023 15:00:00 IDT
+================================================================================
+
+Upgrade urgency SECURITY: See security fixes below.
+
+Security Fixes
+==============
+
+* (CVE-2023-41053) Redis does not correctly identify keys accessed by SORT_RO and
+  as a result may grant users executing this command access to keys that are not
+  explicitly authorized by the ACL configuration.
+
+Bug Fixes
+=========
+
+* Cluster: fix a race condition where a slot migration may revert on a
+  subsequent failover or node joining (#12344)
+* Ensure that the function load timeout is disabled during loading from RDB/AOF
+  and on replicas. (#12451)
+* Fix the assertion when script timeout occurs after it signaled a blocked client (#12459)
+
+
+================================================================================
+Redis 7.0.12   Released Mon July 10 12:00:00 IDT 2023
+================================================================================
+
+Upgrade urgency SECURITY: See security fixes below.
+
+Security Fixes:
+* (CVE-2022-24834) A specially crafted Lua script executing in Redis can trigger
+  a heap overflow in the cjson and cmsgpack libraries, and result in heap
+  corruption and potentially remote code execution. The problem exists in all
+  versions of Redis with Lua scripting support, starting from 2.6, and affects
+  only authenticated and authorized users.
+* (CVE-2023-36824) Extracting key names from a command and a list of arguments
+  may, in some cases, trigger a heap overflow and result in reading random heap
+  memory, heap corruption and potentially remote code execution. Specifically:
+  using COMMAND GETKEYS* and validation of key names in ACL rules.
+
+
+Bug Fixes
+=========
+
+* Re-enable downscale rehashing while there is a fork child (#12276)
+* Fix possible hang in HRANDFIELD, SRANDMEMBER, ZRANDMEMBER when used with `<count>` (#12276)
+* Improve fairness issue in RANDOMKEY, HRANDFIELD, SRANDMEMBER, ZRANDMEMBER, SPOP, and eviction (#12276)
+* Fix WAIT to be effective after a blocked module command being unblocked (#12220)
+* Avoid unnecessary full sync after master restart in a rare case (#12088)
+
+
+================================================================================
 Redis 7.0.11 Released Mon Apr 17 16:00:00 IST 2023
 ================================================================================
 
