@@ -1,3 +1,60 @@
+redis (5:7.0.15-3) unstable; urgency=high
+
+  * Fix two security vulnerabilities:
+
+    - CVE-2024-46981: An authenticated user could have used a specially-crafted
+      Lua script to manipulate the garbage collector and potentially lead to
+      remote code execution.
+
+    * CVE-2024-51741: An authenticated user with sufficient privileges may have
+      created a malformed ACL selector which, when accessed, would have
+      triggered a server panic and subsequent denial of service.
+
+    (Closes: #1092370)
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 21 Jan 2025 10:10:10 +0000
+
+redis (5:7.0.15-2) unstable; urgency=high
+
+  * Fix three new security vulnerabilities:
+
+    - CVE-2024-31227: An authenticated with sufficient privileges could have
+      created a malformed ACL selector which, when accessed, triggered a server
+      panic and subsequent denial of service.
+
+    - CVE-2024-31228: Authenticated users could have triggered a
+      denial-of-service by using specially crafted, long string match patterns
+      on supported commands such as `KEYS`, `SCAN`, `PSUBSCRIBE`, `FUNCTION
+      LIST`, `COMMAND | LIST` and ACL definitions. Matching of extremely long
+      patterns may have resulted in unbounded recursion, leading to stack overflow
+      and process crash.
+
+    - CVE-2024-31449: An authenticated user may have used a specially crafted
+      Lua script to trigger a stack buffer overflow in the bit library, which
+      may have potentially led to remote code execution.
+
+    (Closes: #1084805)
+
+  * Correct a link in previous changelog message.
+
+ -- Chris Lamb <lamby@debian.org>  Wed, 09 Oct 2024 13:41:44 -0700
+
+redis (5:7.0.15-1) unstable; urgency=medium
+
+  * New upstream security release:
+
+    - CVE-2023-41056: In some cases, Redis may incorrectly handle resizing of
+      memory buffers which can result in incorrect accounting of buffer sizes
+      and lead to heap overflow and potential remote code execution.
+      (Closes: #1060316)
+
+    - For more information, please see:
+      <https://raw.githubusercontent.com/redis/redis/7.0/00-RELEASENOTES>
+
+  * Refresh patches.
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 09 Jan 2024 13:42:30 +0000
+
 redis (5:7.0.14-2) unstable; urgency=medium
 
   * Drop ProcSubset=pid hardening flag from the systemd unit files it appears

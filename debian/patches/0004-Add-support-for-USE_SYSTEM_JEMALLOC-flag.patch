@@ -79,7 +79,7 @@ index 1a21579..5bd4144 100644
  
  robj *createObject(int type, void *ptr) {
 diff --git a/src/sds.c b/src/sds.c
-index 8e5863a..94920be 100644
+index 71490d5..fbff91e 100644
 --- a/src/sds.c
 +++ b/src/sds.c
 @@ -39,6 +39,10 @@
