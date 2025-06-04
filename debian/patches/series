@@ -8,3 +8,4 @@ debian-packaging/0001-Set-Debian-configuration-defaults.patch
 0007-CVE-2024-31449.patch
 0008-CVE-2024-46981.patch
 0009-CVE-2024-51741.patch
+0001-deepin-sw_64-support.diff

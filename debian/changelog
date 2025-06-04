@@ -1,3 +1,9 @@
+redis (5:7.0.15-3deepin1) unstable; urgency=medium
+
+  * feat: add sw64 support.
+
+ -- hudeng <hudeng@deepin.org>  Wed, 04 Jun 2025 16:26:29 +0800
+
 redis (5:7.0.15-3) unstable; urgency=high
 
   * Fix two security vulnerabilities:
