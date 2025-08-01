@@ -1,33 +1,14 @@
 /*
- * Copyright (c) 2009-2021, Redis Ltd.
+ * Copyright (c) 2009-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include "script_lua.h"
+#include "fpconv_dtoa.h"
 
 #include "server.h"
 #include "sha1.h"
@@ -50,6 +31,7 @@ static char *libraries_allow_list[] = {
     "math",
     "table",
     "struct",
+    "os",
     NULL,
 };
 
@@ -173,6 +155,7 @@ void* luaGetFromRegistry(lua_State* lua, const char* name) {
     lua_gettable(lua, LUA_REGISTRYINDEX);
 
     if (lua_isnil(lua, -1)) {
+        lua_pop(lua, 1); /* pops the value */
         return NULL;
     }
     /* must be light user data */
@@ -600,7 +583,7 @@ static void luaReplyToRedisReply(client *c, client* script_client, lua_State *lu
          * to push 4 elements to the stack. On failure, return error.
          * Notice that we need, in the worst case, 4 elements because returning a map might
          * require push 4 elements to the Lua stack.*/
-        addReplyErrorFormat(c, "reached lua stack limit");
+        addReplyError(c, "reached lua stack limit");
         lua_pop(lua,1); /* pop the element from the stack */
         return;
     }
@@ -788,8 +771,6 @@ static robj **lua_argv = NULL;
 static int lua_argv_size = 0;
 
 /* Cache of recently used small arguments to avoid malloc calls. */
-#define LUA_CMD_OBJCACHE_SIZE 32
-#define LUA_CMD_OBJCACHE_MAX_LEN 64
 static robj *lua_args_cached_objects[LUA_CMD_OBJCACHE_SIZE];
 static size_t lua_args_cached_objects_len[LUA_CMD_OBJCACHE_SIZE];
 
@@ -818,8 +799,17 @@ static robj **luaArgsToRedisArgv(lua_State *lua, int *argc, int *argv_len) {
             /* We can't use lua_tolstring() for number -> string conversion
              * since Lua uses a format specifier that loses precision. */
             lua_Number num = lua_tonumber(lua,j+1);
-
-            obj_len = snprintf(dbuf,sizeof(dbuf),"%.17g",(double)num);
+            /* Integer printing function is much faster, check if we can safely use it.
+             * Since lua_Number is not explicitly an integer or a double, we need to make an effort
+             * to convert it as an integer when that's possible, since the string could later be used
+             * in a context that doesn't support scientific notation (e.g. 1e9 instead of 100000000). */
+            long long lvalue;
+            if (double2ll((double)num, &lvalue))
+                obj_len = ll2string(dbuf, sizeof(dbuf), lvalue);
+            else {
+                obj_len = fpconv_dtoa((double)num, dbuf);
+                dbuf[obj_len] = '\0';
+            }
             obj_s = dbuf;
         } else {
             obj_s = (char*)lua_tolstring(lua,j+1,&obj_len);
@@ -888,10 +878,7 @@ void freeLuaRedisArgv(robj **argv, int argc, int argv_len) {
 static int luaRedisGenericCommand(lua_State *lua, int raise_error) {
     int j;
     scriptRunCtx* rctx = luaGetFromRegistry(lua, REGISTRY_RUN_CTX_NAME);
-    if (!rctx) {
-        luaPushError(lua, "redis.call/pcall can only be called inside a script invocation");
-        return luaError(lua);
-    }
+    serverAssert(rctx); /* Only supported inside script invocation */
     sds err = NULL;
     client* c = rctx->c;
     sds reply;
@@ -982,7 +969,7 @@ cleanup:
     c->argc = c->argv_len = 0;
     c->user = NULL;
     c->argv = NULL;
-    freeClientArgv(c);
+    resetClient(c);
     inuse--;
 
     if (raise_error) {
@@ -1104,13 +1091,10 @@ static int luaRedisSetReplCommand(lua_State *lua) {
     int flags, argc = lua_gettop(lua);
 
     scriptRunCtx* rctx = luaGetFromRegistry(lua, REGISTRY_RUN_CTX_NAME);
-    if (!rctx) {
-        luaPushError(lua, "redis.set_repl can only be called inside a script invocation");
-        return luaError(lua);
-    }
+    serverAssert(rctx); /* Only supported inside script invocation */
 
     if (argc != 1) {
-        luaPushError(lua, "redis.set_repl() requires two arguments.");
+        luaPushError(lua, "redis.set_repl() requires one argument.");
          return luaError(lua);
     }
 
@@ -1129,10 +1113,7 @@ static int luaRedisSetReplCommand(lua_State *lua) {
  * Checks ACL permissions for given command for the current user. */
 static int luaRedisAclCheckCmdPermissionsCommand(lua_State *lua) {
     scriptRunCtx* rctx = luaGetFromRegistry(lua, REGISTRY_RUN_CTX_NAME);
-    if (!rctx) {
-        luaPushError(lua, "redis.acl_check_cmd can only be called inside a script invocation");
-        return luaError(lua);
-    }
+    serverAssert(rctx); /* Only supported inside script invocation */
     int raise_error = 0;
 
     int argc, argv_len;
@@ -1178,7 +1159,7 @@ static int luaLogCommand(lua_State *lua) {
     }
     level = lua_tonumber(lua,-argc);
     if (level < LL_DEBUG || level > LL_WARNING) {
-        luaPushError(lua, "Invalid debug level.");
+        luaPushError(lua, "Invalid log level.");
         return luaError(lua);
     }
     if (level < server.verbosity) return 0;
@@ -1203,10 +1184,7 @@ static int luaLogCommand(lua_State *lua) {
 /* redis.setresp() */
 static int luaSetResp(lua_State *lua) {
     scriptRunCtx* rctx = luaGetFromRegistry(lua, REGISTRY_RUN_CTX_NAME);
-    if (!rctx) {
-        luaPushError(lua, "redis.setresp can only be called inside a script invocation");
-        return luaError(lua);
-    }
+    serverAssert(rctx); /* Only supported inside script invocation */
     int argc = lua_gettop(lua);
 
     if (argc != 1) {
@@ -1244,6 +1222,7 @@ static void luaLoadLibraries(lua_State *lua) {
     luaLoadLib(lua, LUA_STRLIBNAME, luaopen_string);
     luaLoadLib(lua, LUA_MATHLIBNAME, luaopen_math);
     luaLoadLib(lua, LUA_DBLIBNAME, luaopen_debug);
+    luaLoadLib(lua, LUA_OSLIBNAME, luaopen_os);
     luaLoadLib(lua, "cjson", luaopen_cjson);
     luaLoadLib(lua, "struct", luaopen_struct);
     luaLoadLib(lua, "cmsgpack", luaopen_cmsgpack);
@@ -1251,7 +1230,6 @@ static void luaLoadLibraries(lua_State *lua) {
 
 #if 0 /* Stuff that we don't load currently, for sandboxing concerns. */
     luaLoadLib(lua, LUA_LOADLIBNAME, luaopen_package);
-    luaLoadLib(lua, LUA_OSLIBNAME, luaopen_os);
 #endif
 }
 
@@ -1299,7 +1277,7 @@ void luaSetErrorMetatable(lua_State *lua) {
 static int luaNewIndexAllowList(lua_State *lua) {
     int argc = lua_gettop(lua);
     if (argc != 3) {
-        serverLog(LL_WARNING, "malicious code trying to call luaProtectedTableError with wrong arguments");
+        serverLog(LL_WARNING, "malicious code trying to call luaNewIndexAllowList with wrong arguments");
         luaL_error(lua, "Wrong number of arguments to luaNewIndexAllowList");
     }
     if (!lua_istable(lua, -3)) {
@@ -1532,11 +1510,6 @@ static void luaCreateArray(lua_State *lua, robj **elev, int elec) {
 /* The following implementation is the one shipped with Lua itself but with
  * rand() replaced by redisLrand48(). */
 static int redis_math_random (lua_State *L) {
-  scriptRunCtx* rctx = luaGetFromRegistry(L, REGISTRY_RUN_CTX_NAME);
-  if (!rctx) {
-    return luaL_error(L, "math.random can only be called inside a script invocation");
-  }
-
   /* the `%' avoids the (rare) case of r==1, and is needed also because on
      some systems (SunOS!) `rand()' may return a value larger than RAND_MAX */
   lua_Number r = (lua_Number)(redisLrand48()%REDIS_LRAND48_MAX) /
@@ -1565,10 +1538,6 @@ static int redis_math_random (lua_State *L) {
 }
 
 static int redis_math_randomseed (lua_State *L) {
-  scriptRunCtx* rctx = luaGetFromRegistry(L, REGISTRY_RUN_CTX_NAME);
-  if (!rctx) {
-    return luaL_error(L, "math.randomseed can only be called inside a script invocation");
-  }
   redisSrand48(luaL_checkint(L, 1));
   return 0;
 }
@@ -1577,13 +1546,14 @@ static int redis_math_randomseed (lua_State *L) {
 static void luaMaskCountHook(lua_State *lua, lua_Debug *ar) {
     UNUSED(ar);
     scriptRunCtx* rctx = luaGetFromRegistry(lua, REGISTRY_RUN_CTX_NAME);
+    serverAssert(rctx); /* Only supported inside script invocation */
     if (scriptInterrupt(rctx) == SCRIPT_KILL) {
-        serverLog(LL_WARNING,"Lua script killed by user with SCRIPT KILL.");
+        serverLog(LL_NOTICE,"Lua script killed by user with SCRIPT KILL.");
 
         /*
          * Set the hook to invoke all the time so the user
-         * will not be able to catch the error with pcall and invoke
-         * pcall again which will prevent the script from ever been killed
+         * will not be able to catch the error with pcall and invoke
+         * pcall again which will prevent the script from ever been killed
          */
         lua_sethook(lua, luaMaskCountHook, LUA_MASKLINE, 0);
 
@@ -1604,6 +1574,7 @@ void luaExtractErrorInformation(lua_State *lua, errorInfo *err_info) {
         err_info->line = NULL;
         err_info->source = NULL;
         err_info->ignore_err_stats_update = 0;
+        return;
     }
 
     lua_getfield(lua, -1, "err");
@@ -1680,23 +1651,6 @@ void luaCallFunction(scriptRunCtx* run_ctx, lua_State *lua, robj** keys, size_t 
         err = lua_pcall(lua,2,1,-4);
     }
 
-    /* Call the Lua garbage collector from time to time to avoid a
-     * full cycle performed by Lua, which adds too latency.
-     *
-     * The call is performed every LUA_GC_CYCLE_PERIOD executed commands
-     * (and for LUA_GC_CYCLE_PERIOD collection steps) because calling it
-     * for every command uses too much CPU. */
-    #define LUA_GC_CYCLE_PERIOD 50
-    {
-        static long gc_count = 0;
-
-        gc_count++;
-        if (gc_count == LUA_GC_CYCLE_PERIOD) {
-            lua_gc(lua,LUA_GCSTEP,LUA_GC_CYCLE_PERIOD);
-            gc_count = 0;
-        }
-    }
-
     if (err) {
         /* Error object is a table of the following format:
          * {err='<error msg>', source='<source file>', line=<line>}
@@ -1738,4 +1692,22 @@ void luaCallFunction(scriptRunCtx* run_ctx, lua_State *lua, robj** keys, size_t 
 
 unsigned long luaMemory(lua_State *lua) {
     return lua_gc(lua, LUA_GCCOUNT, 0) * 1024LL;
+}
+
+/* Call the Lua garbage collector from time to time to avoid a
+ * full cycle performed by Lua, which adds too latency.
+ *
+ * The call is performed every LUA_GC_CYCLE_PERIOD executed commands
+ * (and for LUA_GC_CYCLE_PERIOD collection steps) because calling it
+ * for every command uses too much CPU.
+ * 
+ * Each script VM / State (Eval and Functions) maintains its own unique `gc_count`
+ * to control GC independently. */
+#define LUA_GC_CYCLE_PERIOD 50
+void luaGC(lua_State *lua, int *gc_count) {
+    (*gc_count)++;
+    if (*gc_count >= LUA_GC_CYCLE_PERIOD) {
+        lua_gc(lua, LUA_GCSTEP, LUA_GC_CYCLE_PERIOD);
+        *gc_count = 0;
+    }
 }

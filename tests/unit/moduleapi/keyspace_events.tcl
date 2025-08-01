@@ -3,6 +3,10 @@ set testmodule [file normalize tests/modules/keyspace_events.so]
 tags "modules" {
     start_server [list overrides [list loadmodule "$testmodule"]] {
 
+        # avoid using shared integers, to increase the chance of detection heap issues
+        r config set maxmemory-policy allkeys-lru
+        r config set maxmemory 1gb
+
         test {Test loaded key space event} {
             r set x 1
             r hset y f v
@@ -96,6 +100,23 @@ tags "modules" {
 
         test "Unload the module - testkeyspace" {
             assert_equal {OK} [r module unload testkeyspace]
+        }
+
+        test "Verify RM_StringDMA with expiration are not causing invalid memory access" {
+            assert_equal {OK} [r set x 1 EX 1]
+        }
+    }
+
+    start_server {} {
+        test {OnLoad failure will handle un-registration} {
+            catch {r module load $testmodule noload}
+            r set x 1
+            r hset y f v
+            r lpush z 1 2 3
+            r sadd p 1 2 3
+            r zadd t 1 f1 2 f2
+            r xadd s * f v
+            r ping
         }
     }
 }

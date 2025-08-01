@@ -1,43 +1,22 @@
 /* SDSLib 2.0 -- A C dynamic strings library
  *
- * Copyright (c) 2006-2015, Salvatore Sanfilippo <antirez at gmail dot com>
- * Copyright (c) 2015, Oran Agra
- * Copyright (c) 2015, Redis Labs, Inc
+ * Copyright (c) 2006-Present, Redis Ltd.
  * All rights reserved.
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- *   * Redistributions of source code must retain the above copyright notice,
- *     this list of conditions and the following disclaimer.
- *   * Redistributions in binary form must reproduce the above copyright
- *     notice, this list of conditions and the following disclaimer in the
- *     documentation and/or other materials provided with the distribution.
- *   * Neither the name of Redis nor the names of its contributors may be used
- *     to endorse or promote products derived from this software without
- *     specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT OWNER OR CONTRIBUTORS BE
- * LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
- * CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF
- * SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS
- * INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN
- * CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE)
- * ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
- * POSSIBILITY OF SUCH DAMAGE.
+ * Licensed under your choice of (a) the Redis Source Available License 2.0
+ * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+ * GNU Affero General Public License v3 (AGPLv3).
  */
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
-#include <assert.h>
 #include <limits.h>
+#include "redisassert.h"
 #include "sds.h"
 #include "sdsalloc.h"
+#include "util.h"
 
 const char *SDS_NOINIT = "SDS_NOINIT";
 
@@ -194,6 +173,11 @@ sds sdsdup(const sds s) {
 void sdsfree(sds s) {
     if (s == NULL) return;
     s_free((char*)s-sdsHdrSize(s[-1]));
+}
+
+/* Generic version of sdsfree. */
+void sdsfreegeneric(void *s) {
+    sdsfree((sds)s);
 }
 
 /* Set the sds string length to the length as obtained with strlen(), so
@@ -528,90 +512,13 @@ sds sdscpy(sds s, const char *t) {
     return sdscpylen(s, t, strlen(t));
 }
 
-/* Helper for sdscatlonglong() doing the actual number -> string
- * conversion. 's' must point to a string with room for at least
- * SDS_LLSTR_SIZE bytes.
- *
- * The function returns the length of the null-terminated string
- * representation stored at 's'. */
-#define SDS_LLSTR_SIZE 21
-int sdsll2str(char *s, long long value) {
-    char *p, aux;
-    unsigned long long v;
-    size_t l;
-
-    /* Generate the string representation, this method produces
-     * a reversed string. */
-    if (value < 0) {
-        /* Since v is unsigned, if value==LLONG_MIN, -LLONG_MIN will overflow. */
-        if (value != LLONG_MIN) {
-            v = -value;
-        } else {
-            v = ((unsigned long long)LLONG_MAX) + 1;
-        }
-    } else {
-        v = value;
-    }
-
-    p = s;
-    do {
-        *p++ = '0'+(v%10);
-        v /= 10;
-    } while(v);
-    if (value < 0) *p++ = '-';
-
-    /* Compute length and add null term. */
-    l = p-s;
-    *p = '\0';
-
-    /* Reverse the string. */
-    p--;
-    while(s < p) {
-        aux = *s;
-        *s = *p;
-        *p = aux;
-        s++;
-        p--;
-    }
-    return l;
-}
-
-/* Identical sdsll2str(), but for unsigned long long type. */
-int sdsull2str(char *s, unsigned long long v) {
-    char *p, aux;
-    size_t l;
-
-    /* Generate the string representation, this method produces
-     * a reversed string. */
-    p = s;
-    do {
-        *p++ = '0'+(v%10);
-        v /= 10;
-    } while(v);
-
-    /* Compute length and add null term. */
-    l = p-s;
-    *p = '\0';
-
-    /* Reverse the string. */
-    p--;
-    while(s < p) {
-        aux = *s;
-        *s = *p;
-        *p = aux;
-        s++;
-        p--;
-    }
-    return l;
-}
-
 /* Create an sds string from a long long value. It is much faster than:
  *
  * sdscatprintf(sdsempty(),"%lld\n", value);
  */
 sds sdsfromlonglong(long long value) {
-    char buf[SDS_LLSTR_SIZE];
-    int len = sdsll2str(buf,value);
+    char buf[LONG_STR_SIZE];
+    int len = ll2string(buf,sizeof(buf),value);
 
     return sdsnewlen(buf,len);
 }
@@ -747,8 +654,8 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                 else
                     num = va_arg(ap,long long);
                 {
-                    char buf[SDS_LLSTR_SIZE];
-                    l = sdsll2str(buf,num);
+                    char buf[LONG_STR_SIZE];
+                    l = ll2string(buf,sizeof(buf),num);
                     if (sdsavail(s) < l) {
                         s = sdsMakeRoomFor(s,l);
                     }
@@ -764,8 +671,8 @@ sds sdscatfmt(sds s, char const *fmt, ...) {
                 else
                     unum = va_arg(ap,unsigned long long);
                 {
-                    char buf[SDS_LLSTR_SIZE];
-                    l = sdsull2str(buf,unum);
+                    char buf[LONG_STR_SIZE];
+                    l = ull2string(buf,sizeof(buf),unum);
                     if (sdsavail(s) < l) {
                         s = sdsMakeRoomFor(s,l);
                     }
@@ -986,6 +893,7 @@ void sdsfreesplitres(sds *tokens, int count) {
  * After the call, the modified sds string is no longer valid and all the
  * references must be substituted with the new pointer returned by the call. */
 sds sdscatrepr(sds s, const char *p, size_t len) {
+    s = sdsMakeRoomFor(s, len + 2);
     s = sdscatlen(s,"\"",1);
     while(len--) {
         switch(*p) {
@@ -1000,7 +908,7 @@ sds sdscatrepr(sds s, const char *p, size_t len) {
         case '\b': s = sdscatlen(s,"\\b",2); break;
         default:
             if (isprint(*p))
-                s = sdscatprintf(s,"%c",*p);
+                s = sdscatlen(s, p, 1);
             else
                 s = sdscatprintf(s,"\\x%02x",(unsigned char)*p);
             break;
@@ -1541,29 +1449,29 @@ int sdsTest(int argc, char **argv, int flags) {
         /* Test sdsresize - extend */
         x = sdsnew("1234567890123456789012345678901234567890");
         x = sdsResize(x, 200, 1);
-        test_cond("sdsrezie() expand len", sdslen(x) == 40);
-        test_cond("sdsrezie() expand strlen", strlen(x) == 40);
-        test_cond("sdsrezie() expand alloc", sdsalloc(x) == 200);
+        test_cond("sdsresize() expand len", sdslen(x) == 40);
+        test_cond("sdsresize() expand strlen", strlen(x) == 40);
+        test_cond("sdsresize() expand alloc", sdsalloc(x) == 200);
         /* Test sdsresize - trim free space */
         x = sdsResize(x, 80, 1);
-        test_cond("sdsrezie() shrink len", sdslen(x) == 40);
-        test_cond("sdsrezie() shrink strlen", strlen(x) == 40);
-        test_cond("sdsrezie() shrink alloc", sdsalloc(x) == 80);
+        test_cond("sdsresize() shrink len", sdslen(x) == 40);
+        test_cond("sdsresize() shrink strlen", strlen(x) == 40);
+        test_cond("sdsresize() shrink alloc", sdsalloc(x) == 80);
         /* Test sdsresize - crop used space */
         x = sdsResize(x, 30, 1);
-        test_cond("sdsrezie() crop len", sdslen(x) == 30);
-        test_cond("sdsrezie() crop strlen", strlen(x) == 30);
-        test_cond("sdsrezie() crop alloc", sdsalloc(x) == 30);
+        test_cond("sdsresize() crop len", sdslen(x) == 30);
+        test_cond("sdsresize() crop strlen", strlen(x) == 30);
+        test_cond("sdsresize() crop alloc", sdsalloc(x) == 30);
         /* Test sdsresize - extend to different class */
         x = sdsResize(x, 400, 1);
-        test_cond("sdsrezie() expand len", sdslen(x) == 30);
-        test_cond("sdsrezie() expand strlen", strlen(x) == 30);
-        test_cond("sdsrezie() expand alloc", sdsalloc(x) == 400);
+        test_cond("sdsresize() expand len", sdslen(x) == 30);
+        test_cond("sdsresize() expand strlen", strlen(x) == 30);
+        test_cond("sdsresize() expand alloc", sdsalloc(x) == 400);
         /* Test sdsresize - shrink to different class */
         x = sdsResize(x, 4, 1);
-        test_cond("sdsrezie() crop len", sdslen(x) == 4);
-        test_cond("sdsrezie() crop strlen", strlen(x) == 4);
-        test_cond("sdsrezie() crop alloc", sdsalloc(x) == 4);
+        test_cond("sdsresize() crop len", sdslen(x) == 4);
+        test_cond("sdsresize() crop strlen", strlen(x) == 4);
+        test_cond("sdsresize() crop alloc", sdsalloc(x) == 4);
         sdsfree(x);
     }
     return 0;

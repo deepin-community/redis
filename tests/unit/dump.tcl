@@ -59,15 +59,31 @@ start_server {tags {"dump"}} {
         assert_equal [r get foo] {bar}
         r config set maxmemory-policy noeviction
     } {OK} {needs:config-maxmemory}
-    
+
     test {RESTORE can set LFU} {
         r set foo bar
         set encoded [r dump foo]
         r del foo
         r config set maxmemory-policy allkeys-lfu
         r restore foo 0 $encoded freq 100
+
+        # We need to determine whether the `object` operation happens within the same minute or crosses into a new one
+        # This will help us verify if the freq remains 100 or decays due to a minute transition
+        set start [clock format [clock seconds] -format %M]
         set freq [r object freq foo]
-        assert {$freq == 100}
+        set end [clock format [clock seconds] -format %M]
+
+        if { $start == $end } {
+            # If the minutes haven't changed (i.e., the restore and object happened within the same minute),
+            # the freq should remain 100 as no decay has occurred yet.
+            assert {$freq == 100}
+        } else {
+            # If the object operation crosses into a new minute, freq may have already decayed by 1 (99),
+            # or it may still be 100 if the minute update hasn't been applied yet when the operation is performed.
+            # The decay might only take effect after the operation completes and the minute is updated.
+            assert {($freq == 100) || ($freq == 99)}
+        }
+
         r get foo
         assert_equal [r get foo] {bar}
         r config set maxmemory-policy noeviction
@@ -91,10 +107,38 @@ start_server {tags {"dump"}} {
         r get foo
     } {bar2}
 
-    test {RESTORE can detect a syntax error for unrecongized options} {
+    test {RESTORE can detect a syntax error for unrecognized options} {
         catch {r restore foo 0 "..." invalid-option} e
         set e
     } {*syntax*}
+
+    test {RESTORE should not store key that are already expired, with REPLACE will propagate it as DEL or UNLINK} {
+        r del key1{t} key2{t}
+        r set key1{t} value2
+        r lpush key2{t} 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64 65
+
+        r set key{t} value
+        set encoded [r dump key{t}]
+        set now [clock milliseconds]
+
+        set repl [attach_to_replication_stream]
+
+        # Keys that have expired will not be stored.
+        r config set lazyfree-lazy-server-del no
+        assert_equal {OK} [r restore key1{t} [expr $now-5000] $encoded replace absttl]
+        r config set lazyfree-lazy-server-del yes
+        assert_equal {OK} [r restore key2{t} [expr $now-5000] $encoded replace absttl]
+        assert_equal {0} [r exists key1{t} key2{t}]
+
+        # Verify the propagate of DEL and UNLINK.
+        assert_replication_stream $repl {
+            {select *}
+            {del key1{t}}
+            {unlink key2{t}}
+        }
+
+        close_replication_stream $repl
+    } {} {needs:repl}
 
     test {DUMP of non existing key returns nil} {
         r dump nonexisting_key

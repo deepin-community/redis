@@ -3,3 +3,4 @@ Bug-Database: https://github.com/redis/redis/issues
 Bug-Submit: https://github.com/redis/redis/issues/new
 Repository: https://github.com/redis/redis.git
 Repository-Browse: https://github.com/redis/redis
+Security-Contact: https://github.com/redis/redis/tree/HEAD/SECURITY.md

@@ -68,7 +68,7 @@ start_server {tags {"scripting"}} {
     } {}
 
     test {EVAL - Return table with a metatable that call redis} {
-        run_script {local a = {}; setmetatable(a,{__index=function() redis.call('set', 'x', '1') end}) return a} 0
+        run_script {local a = {}; setmetatable(a,{__index=function() redis.call('set', 'x', '1') end}) return a} 1 x
         # make sure x was not set
         r get x
     } {}
@@ -119,6 +119,10 @@ start_server {tags {"scripting"}} {
         r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey
     } {myval}
 
+    test {EVALSHA_RO - Can we call a SHA1 if already defined?} {
+        r evalsha_ro fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey
+    } {myval}
+
     test {EVALSHA - Can we call a SHA1 in uppercase?} {
         r evalsha FD758D1589D044DD850A6F05D52F2EEFD27F033F 1 mykey
     } {myval}
@@ -141,6 +145,14 @@ start_server {tags {"scripting"}} {
             return {type(foo),foo}
         } 1 x
     } {number 1}
+
+    test {EVAL - Lua number -> Redis integer conversion} {
+        r del hash
+        run_script {
+            local foo = redis.pcall('hincrby','hash','field',200000000)
+            return {type(foo),foo}
+        } 0
+    } {number 200000000}
 
     test {EVAL - Redis bulk -> Lua type conversion} {
         r set mykey myval
@@ -213,57 +225,87 @@ start_server {tags {"scripting"}} {
         } {*execution time*}
     }
 
-    test {EVAL - Scripts can't run blpop command} {
-        set e {}
-        catch {run_script {return redis.pcall('blpop','x',0)} 0} e
-        set e
-    } {*not allowed*}
+    test {EVAL - Scripts do not block on blpop command} {
+        r lpush l 1
+        r lpop l
+        run_script {return redis.pcall('blpop','l',0)} 1 l
+    } {}
 
-    test {EVAL - Scripts can't run brpop command} {
-        set e {}
-        catch {run_script {return redis.pcall('brpop','empty_list',0)} 0} e
-        set e
-    } {*not allowed*}
+    test {EVAL - Scripts do not block on brpop command} {
+        r lpush l 1
+        r lpop l
+        run_script {return redis.pcall('brpop','l',0)} 1 l
+    } {}
 
-    test {EVAL - Scripts can't run brpoplpush command} {
-        set e {}
-        catch {run_script {return redis.pcall('brpoplpush','empty_list1', 'empty_list2',0)} 0} e
-        set e
-    } {*not allowed*}
+    test {EVAL - Scripts do not block on brpoplpush command} {
+        r lpush empty_list1{t} 1
+        r lpop empty_list1{t}
+        run_script {return redis.pcall('brpoplpush','empty_list1{t}', 'empty_list2{t}',0)} 2 empty_list1{t} empty_list2{t}
+    } {}
 
-    test {EVAL - Scripts can't run blmove command} {
-        set e {}
-        catch {run_script {return redis.pcall('blmove','empty_list1', 'empty_list2', 'LEFT', 'LEFT', 0)} 0} e
-        set e
-    } {*not allowed*}
+    test {EVAL - Scripts do not block on blmove command} {
+        r lpush empty_list1{t} 1
+        r lpop empty_list1{t}
+        run_script {return redis.pcall('blmove','empty_list1{t}', 'empty_list2{t}', 'LEFT', 'LEFT', 0)} 2 empty_list1{t} empty_list2{t}
+    } {}
 
-    test {EVAL - Scripts can't run bzpopmin command} {
-        set e {}
-        catch {run_script {return redis.pcall('bzpopmin','empty_zset', 0)} 0} e
-        set e
-    } {*not allowed*}
+    test {EVAL - Scripts do not block on bzpopmin command} {
+        r zadd empty_zset 10 foo
+        r zmpop 1 empty_zset MIN
+        run_script {return redis.pcall('bzpopmin','empty_zset', 0)} 1 empty_zset
+    } {}
 
-    test {EVAL - Scripts can't run bzpopmax command} {
-        set e {}
-        catch {run_script {return redis.pcall('bzpopmax','empty_zset', 0)} 0} e
-        set e
-    } {*not allowed*}
+    test {EVAL - Scripts do not block on bzpopmax command} {
+        r zadd empty_zset 10 foo
+        r zmpop 1 empty_zset MIN
+        run_script {return redis.pcall('bzpopmax','empty_zset', 0)} 1 empty_zset
+    } {}
 
-    test {EVAL - Scripts can't run XREAD and XREADGROUP with BLOCK option} {
+    test {EVAL - Scripts do not block on wait} {
+        run_script {return redis.pcall('wait','1','0')} 0
+    } {0}
+
+    test {EVAL - Scripts do not block on waitaof} {
+        r config set appendonly no
+        run_script {return redis.pcall('waitaof','0','1','0')} 0
+    } {0 0}
+
+    test {EVAL - Scripts do not block on XREAD with BLOCK option} {
         r del s
         r xgroup create s g $ MKSTREAM
         set res [run_script {return redis.pcall('xread','STREAMS','s','$')} 1 s]
         assert {$res eq {}}
-        assert_error "*xread command is not allowed with BLOCK option from scripts" {run_script {return redis.pcall('xread','BLOCK',0,'STREAMS','s','$')} 1 s}
+        run_script {return redis.pcall('xread','BLOCK',0,'STREAMS','s','$')} 1 s
+    } {}
+
+    test {EVAL - Scripts do not block on XREADGROUP with BLOCK option} {
         set res [run_script {return redis.pcall('xreadgroup','group','g','c','STREAMS','s','>')} 1 s]
         assert {$res eq {}}
-        assert_error "*xreadgroup command is not allowed with BLOCK option from scripts" {run_script {return redis.pcall('xreadgroup','group','g','c','BLOCK',0,'STREAMS','s','>')} 1 s}
+        run_script {return redis.pcall('xreadgroup','group','g','c','BLOCK',0,'STREAMS','s','>')} 1 s
+    } {}
+
+    test {EVAL - Scripts do not block on XREAD with BLOCK option -- non empty stream} {
+        r XADD s * a 1
+        set res [run_script {return redis.pcall('xread','BLOCK',0,'STREAMS','s','$')} 1 s]
+        assert {$res eq {}}
+
+        set res [run_script {return redis.pcall('xread','BLOCK',0,'STREAMS','s','0-0')} 1 s]
+        assert {[lrange [lindex $res 0 1 0 1] 0 1] eq {a 1}}
     }
+
+    test {EVAL - Scripts do not block on XREADGROUP with BLOCK option -- non empty stream} {
+        r XADD s * b 2
+        set res [
+            run_script {return redis.pcall('xreadgroup','group','g','c','BLOCK',0,'STREAMS','s','>')} 1 s
+        ]
+        assert {[llength [lindex $res 0 1]] == 2}
+        lindex $res 0 1 0 1
+    } {a 1}
 
     test {EVAL - Scripts can run non-deterministic commands} {
         set e {}
         catch {
-            run_script "redis.pcall('randomkey'); return redis.pcall('set','x','ciao')" 0
+            run_script {redis.pcall('randomkey'); return redis.pcall('set','x','ciao')} 1 x
         } e
         set e
     } {*OK*}
@@ -298,6 +340,13 @@ start_server {tags {"scripting"}} {
         } e
         set e
     } {*against a key*}
+
+    test {EVAL - JSON string encoding a string larger than 2GB} {
+        run_script {
+            local s = string.rep("a", 1024 * 1024 * 1024)
+            return #cjson.encode(s..s..s)
+        } 0
+    } {3221225474} {large-memory} ;# length includes two double quotes at both ends
 
     test {EVAL - JSON numeric decoding} {
         # We must return the table as a string because otherwise
@@ -528,13 +577,19 @@ start_server {tags {"scripting"}} {
     # script command is only relevant for is_eval Lua
     test {SCRIPTING FLUSH - is able to clear the scripts cache?} {
         r set mykey myval
+
+        r script load {return redis.call('get',KEYS[1])}
         set v [r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey]
         assert_equal $v myval
-        set e ""
         r script flush
-        catch {r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey} e
-        set e
-    } {NOSCRIPT*}
+        assert_error {NOSCRIPT*} {r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey}
+
+        r eval {return redis.call('get',KEYS[1])} 1 mykey
+        set v [r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey]
+        assert_equal $v myval
+        r script flush
+        assert_error {NOSCRIPT*} {r evalsha fd758d1589d044dd850a6f05d52f2eefd27f033f 1 mykey}
+    }
 
     test {SCRIPTING FLUSH ASYNC} {
         for {set j 0} {$j < 100} {incr j} {
@@ -580,6 +635,52 @@ start_server {tags {"scripting"}} {
              [run_script {return redis.sha1hex('Pizza & Mandolino')} 0]
     } {da39a3ee5e6b4b0d3255bfef95601890afd80709 74822d82031af7493c20eefa13bd07ec4fada82f}
 
+    test "Measures elapsed time os.clock()" {
+        set escaped [run_script {
+            local start = os.clock()
+            while os.clock() - start < 1 do end
+            return {double = os.clock() - start}
+        } 0]
+        assert_morethan_equal $escaped 1 ;# 1 second
+    }
+
+    test "Prohibit dangerous lua methods in sandbox" {
+        assert_equal "" [run_script {
+            local allowed_methods = {"clock"}
+            -- Find a value from a tuple and return the position.
+            local indexOf = function(tuple, value)
+                for i, v in ipairs(tuple) do
+                    if v == value then return i end
+                end
+                return nil
+            end
+            -- Check for disallowed methods and verify all allowed methods exist.
+            -- If an allowed method is found, it's removed from 'allowed_methods'.
+            -- If 'allowed_methods' is empty at the end, all allowed methods were found.
+            for key, value in pairs(os) do
+                local index = indexOf(allowed_methods, key)
+                if index == nil or type(value) ~= "function" then
+                    return "Disallowed "..type(value)..":"..key
+                end
+                table.remove(allowed_methods, index)
+            end
+            if #allowed_methods ~= 0 then
+                return "Expected method not found: "..table.concat(allowed_methods, ",")
+            end
+            return ""
+        } 0]
+    }
+
+    test "Verify execution of prohibit dangerous Lua methods will fail" {
+        assert_error {ERR *attempt to call field 'execute'*} {run_script {os.execute()} 0}
+        assert_error {ERR *attempt to call field 'exit'*} {run_script {os.exit()} 0}
+        assert_error {ERR *attempt to call field 'getenv'*} {run_script {os.getenv()} 0}
+        assert_error {ERR *attempt to call field 'remove'*} {run_script {os.remove()} 0}
+        assert_error {ERR *attempt to call field 'rename'*} {run_script {os.rename()} 0}
+        assert_error {ERR *attempt to call field 'setlocale'*} {run_script {os.setlocale()} 0}
+        assert_error {ERR *attempt to call field 'tmpname'*} {run_script {os.tmpname()} 0}
+    }
+
     test {Globals protection reading an undeclared global variable} {
         catch {run_script {return a} 0} e
         set e
@@ -589,6 +690,12 @@ start_server {tags {"scripting"}} {
         catch {run_script {a=10} 0} e
         set e
     } {ERR *Attempt to modify a readonly table*}
+
+    test {lua bit.tohex bug} {
+        set res [run_script {return bit.tohex(65535, -2147483648)} 0]
+        r ping
+        set res
+    } {0000FFFF}
 
     test {Test an example script DECR_IF_GT} {
         set decr_if_gt {
@@ -824,8 +931,9 @@ start_server {tags {"scripting"}} {
         assert_equal $res $expected_list
         set res [run_script {redis.setresp(2); return redis.call('hgetall', KEYS[1])} 1 hash]
         assert_equal $res $expected_list
-    }
+    } {} {resp3}
 
+    if {!$::log_req_res} { # this test creates a huge nested array which python can't handle (RecursionError: maximum recursion depth exceeded in comparison)
     test {Script return recursive object} {
         r readraw 1
         set res [run_script {local a = {}; local b = {a}; a[1] = b; return a} 0]
@@ -841,6 +949,7 @@ start_server {tags {"scripting"}} {
         # make sure the connection is still valid
         assert_equal [r ping] {PONG}
     }
+    }
 
     test {Script check unpack with massive arguments} {
         run_script {
@@ -849,7 +958,7 @@ start_server {tags {"scripting"}} {
                 a[i] = 1
             end
             return redis.call("lpush", "l", unpack(a))
-        } 0
+        } 1 l
     } {7999}
 
     test "Script read key with expiration set" {
@@ -860,7 +969,7 @@ start_server {tags {"scripting"}} {
              else
                  return redis.call("EXISTS", "key")
              end
-        } 0] "value"
+        } 1 key] "value"
     }
 
     test "Script del key with expiration set" {
@@ -868,7 +977,7 @@ start_server {tags {"scripting"}} {
         assert_equal [run_script {
              redis.call("DEL", "key")
              return redis.call("EXISTS", "key")
-        } 0] 0
+        } 1 key] 0
     }
     
     test "Script ACL check" {
@@ -1255,14 +1364,14 @@ start_server {tags {"scripting"}} {
                     redis.call("incr","x")
                     redis.call("select","11")
                     redis.call("incr","z")
-                } 0
+                } 3 foo1 x z
                 run_script {
                     redis.call("set","foo1","bar1")
                     redis.call("select","10")
                     redis.call("incr","x")
                     redis.call("select","11")
                     redis.call("incr","z")
-                } 0
+                } 3 foo1 x z
                 wait_for_condition 50 100 {
                     [debug_digest -1] eq [debug_digest]
                 } else {
@@ -1320,7 +1429,7 @@ start_server {tags {"scripting repl external:skip"}} {
                 redis.call('set','c','3');
                 redis.set_repl(redis.REPL_ALL);
                 redis.call('set','d','4');
-            } 0
+            } 4 a b c d
 
             wait_for_condition 50 100 {
                 [r -1 mget a b c d] eq {1 {} {} 4}
@@ -1418,6 +1527,93 @@ start_server {tags {"scripting needs:debug external:skip"}} {
         assert_equal [r ping] {PONG}
     }
 }
+
+start_server {tags {"scripting external:skip"}} {
+    test {Lua scripts eviction does not generate many scripts} {
+        r script flush
+        r config resetstat
+
+        # "return 1" sha is: e0e1f9fabfc9d4800c877a703b823ac0578ff8db
+        # "return 500" sha is: 98fe65896b61b785c5ed328a5a0a1421f4f1490c
+        for {set j 1} {$j <= 250} {incr j} {
+            r eval "return $j" 0
+        }
+        for {set j 251} {$j <= 500} {incr j} {
+            r eval_ro "return $j" 0
+        }
+        assert_equal [s number_of_cached_scripts] 500
+        assert_equal 1 [r evalsha e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0]
+        assert_equal 1 [r evalsha_ro e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0]
+        assert_equal 500 [r evalsha 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0]
+        assert_equal 500 [r evalsha_ro 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0]
+
+        # Scripts between "return 1" and "return 500" are evicted
+        for {set j 501} {$j <= 750} {incr j} {
+            r eval "return $j" 0
+        }
+        for {set j 751} {$j <= 1000} {incr j} {
+            r eval "return $j" 0
+        }
+        assert_error {NOSCRIPT*} {r evalsha e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0}
+        assert_error {NOSCRIPT*} {r evalsha_ro e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0}
+        assert_error {NOSCRIPT*} {r evalsha 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0}
+        assert_error {NOSCRIPT*} {r evalsha_ro 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0}
+
+        assert_equal [s evicted_scripts] 500
+        assert_equal [s number_of_cached_scripts] 500
+    }
+
+    test {Lua scripts eviction is plain LRU} {
+        r script flush
+        r config resetstat
+
+        # "return 1" sha is: e0e1f9fabfc9d4800c877a703b823ac0578ff8db
+        # "return 2" sha is: 7f923f79fe76194c868d7e1d0820de36700eb649
+        # "return 3" sha is: 09d3822de862f46d784e6a36848b4f0736dda47a
+        # "return 500" sha is: 98fe65896b61b785c5ed328a5a0a1421f4f1490c
+        # "return 1000" sha is: 94f1a7bc9f985a1a1d5a826a85579137d9d840c8
+        for {set j 1} {$j <= 500} {incr j} {
+            r eval "return $j" 0
+        }
+
+        # Call "return 1" to move it to the tail.
+        r eval "return 1" 0
+        # Call "return 2" to move it to the tail.
+        r evalsha 7f923f79fe76194c868d7e1d0820de36700eb649 0
+        # Create a new script, "return 3" will be evicted.
+        r eval "return 1000" 0
+        # "return 1" is ok since it was moved to tail.
+        assert_equal 1 [r evalsha e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0]
+        # "return 2" is ok since it was moved to tail.
+        assert_equal 1 [r evalsha e0e1f9fabfc9d4800c877a703b823ac0578ff8db 0]
+        # "return 3" was evicted.
+        assert_error {NOSCRIPT*} {r evalsha 09d3822de862f46d784e6a36848b4f0736dda47a 0}
+        # Others are ok.
+        assert_equal 500 [r evalsha 98fe65896b61b785c5ed328a5a0a1421f4f1490c 0]
+        assert_equal 1000 [r evalsha 94f1a7bc9f985a1a1d5a826a85579137d9d840c8 0]
+
+        assert_equal [s evicted_scripts] 1
+        assert_equal [s number_of_cached_scripts] 500
+    }
+
+    test {Lua scripts eviction does not affect script load} {
+        r script flush
+        r config resetstat
+
+        set num [randomRange 500 1000]
+        for {set j 1} {$j <= $num} {incr j} {
+            r script load "return $j"
+            r eval "return 'str_$j'" 0
+        }
+        set evicted [s evicted_scripts]
+        set cached [s number_of_cached_scripts]
+        # evicted = num eval scripts - 500 eval scripts
+        assert_equal $evicted [expr $num-500]
+        # cached = num load scripts + 500 eval scripts
+        assert_equal $cached [expr $num+500]
+    }
+}
+
 } ;# is_eval
 
 start_server {tags {"scripting needs:debug"}} {
@@ -1425,8 +1621,13 @@ start_server {tags {"scripting needs:debug"}} {
 
     for {set i 2} {$i <= 3} {incr i} {
         for {set client_proto 2} {$client_proto <= 3} {incr client_proto} {
-            set extra "RESP$i/$client_proto"
+            if {[lsearch $::denytags "resp3"] >= 0} {
+                if {$client_proto == 3} {continue}
+            } elseif {$::force_resp3} {
+                if {$client_proto == 2} {continue}
+            }
             r hello $client_proto
+            set extra "RESP$i/$client_proto"
             r readraw 1
 
             test "test $extra big number protocol parsing" {
@@ -1533,6 +1734,7 @@ start_server {tags {"scripting needs:debug"}} {
             }
 
             r readraw 0
+            r hello 2
         }
     }
 
@@ -1548,7 +1750,7 @@ start_server {tags {"scripting needs:debug"}} {
             redis.call("SET", "key", "value", "PX", "1")
             redis.call("DEBUG", "SLEEP", 0.01)
             return redis.call("EXISTS", "key")
-        } 0] 1
+        } 1 key] 1
 
         assert_equal 0 [r EXISTS key]
     }
@@ -1561,12 +1763,174 @@ start_server {tags {"scripting needs:debug"}} {
         # use DEBUG OBJECT to make sure it doesn't error (means the key still exists)
         r DEBUG OBJECT key
 
-        assert_equal [run_script "return redis.call('EXISTS', 'key')" 0] 0
+        assert_equal [run_script {return redis.call('EXISTS', 'key')} 1 key] 0
         assert_equal 0 [r EXISTS key]
         r DEBUG set-active-expire 1
     }
 
+    test "TIME command using cached time" {
+        set res [run_script {
+            local result1 = {redis.call("TIME")}
+            redis.call("DEBUG", "SLEEP", 0.01)
+            local result2 = {redis.call("TIME")}
+            return {result1, result2}
+         } 0]
+         assert_equal [lindex $res 0] [lindex $res 1]
+     }
+
+    test "Script block the time in some expiration related commands" {
+        # The test uses different commands to set the "same" expiration time for different keys,
+        # and interspersed with "DEBUG SLEEP", to verify that time is frozen in script.
+        # The commands involved are [P]TTL / SET EX[PX] / [P]EXPIRE / GETEX / [P]SETEX / [P]EXPIRETIME
+        set res [run_script {
+            redis.call("SET", "key1{t}", "value", "EX", 1)
+            redis.call("DEBUG", "SLEEP", 0.01)
+
+            redis.call("SET", "key2{t}", "value", "PX", 1000)
+            redis.call("DEBUG", "SLEEP", 0.01)
+
+            redis.call("SET", "key3{t}", "value")
+            redis.call("EXPIRE", "key3{t}", 1)
+            redis.call("DEBUG", "SLEEP", 0.01)
+
+            redis.call("SET", "key4{t}", "value")
+            redis.call("PEXPIRE", "key4{t}", 1000)
+            redis.call("DEBUG", "SLEEP", 0.01)
+
+            redis.call("SETEX", "key5{t}", 1, "value")
+            redis.call("DEBUG", "SLEEP", 0.01)
+
+            redis.call("PSETEX", "key6{t}", 1000, "value")
+            redis.call("DEBUG", "SLEEP", 0.01)
+
+            redis.call("SET", "key7{t}", "value")
+            redis.call("GETEX", "key7{t}", "EX", 1)
+            redis.call("DEBUG", "SLEEP", 0.01)
+
+            redis.call("SET", "key8{t}", "value")
+            redis.call("GETEX", "key8{t}", "PX", 1000)
+            redis.call("DEBUG", "SLEEP", 0.01)
+
+            local ttl_results = {redis.call("TTL", "key1{t}"),
+                                 redis.call("TTL", "key2{t}"),
+                                 redis.call("TTL", "key3{t}"),
+                                 redis.call("TTL", "key4{t}"),
+                                 redis.call("TTL", "key5{t}"),
+                                 redis.call("TTL", "key6{t}"),
+                                 redis.call("TTL", "key7{t}"),
+                                 redis.call("TTL", "key8{t}")}
+
+            local pttl_results = {redis.call("PTTL", "key1{t}"),
+                                  redis.call("PTTL", "key2{t}"),
+                                  redis.call("PTTL", "key3{t}"),
+                                  redis.call("PTTL", "key4{t}"),
+                                  redis.call("PTTL", "key5{t}"),
+                                  redis.call("PTTL", "key6{t}"),
+                                  redis.call("PTTL", "key7{t}"),
+                                  redis.call("PTTL", "key8{t}")}
+
+            local expiretime_results = {redis.call("EXPIRETIME", "key1{t}"),
+                                        redis.call("EXPIRETIME", "key2{t}"),
+                                        redis.call("EXPIRETIME", "key3{t}"),
+                                        redis.call("EXPIRETIME", "key4{t}"),
+                                        redis.call("EXPIRETIME", "key5{t}"),
+                                        redis.call("EXPIRETIME", "key6{t}"),
+                                        redis.call("EXPIRETIME", "key7{t}"),
+                                        redis.call("EXPIRETIME", "key8{t}")}
+
+            local pexpiretime_results = {redis.call("PEXPIRETIME", "key1{t}"),
+                                         redis.call("PEXPIRETIME", "key2{t}"),
+                                         redis.call("PEXPIRETIME", "key3{t}"),
+                                         redis.call("PEXPIRETIME", "key4{t}"),
+                                         redis.call("PEXPIRETIME", "key5{t}"),
+                                         redis.call("PEXPIRETIME", "key6{t}"),
+                                         redis.call("PEXPIRETIME", "key7{t}"),
+                                         redis.call("PEXPIRETIME", "key8{t}")}
+
+            return {ttl_results, pttl_results, expiretime_results, pexpiretime_results}
+        } 8 key1{t} key2{t} key3{t} key4{t} key5{t} key6{t} key7{t} key8{t}]
+
+        # The elements in each list are equal.
+        assert_equal 1 [llength [lsort -unique [lindex $res 0]]]
+        assert_equal 1 [llength [lsort -unique [lindex $res 1]]]
+        assert_equal 1 [llength [lsort -unique [lindex $res 2]]]
+        assert_equal 1 [llength [lsort -unique [lindex $res 3]]]
+
+        # Then we check that the expiration time is set successfully.
+        assert_morethan [lindex $res 0] 0
+        assert_morethan [lindex $res 1] 0
+        assert_morethan [lindex $res 2] 0
+        assert_morethan [lindex $res 3] 0
+    }
+
+    test "RESTORE expired keys with expiration time" {
+        set res [run_script {
+            redis.call("SET", "key1{t}", "value")
+            local encoded = redis.call("DUMP", "key1{t}")
+
+            redis.call("RESTORE", "key2{t}", 1, encoded, "REPLACE")
+            redis.call("DEBUG", "SLEEP", 0.01)
+            redis.call("RESTORE", "key3{t}", 1, encoded, "REPLACE")
+
+            return {redis.call("PEXPIRETIME", "key2{t}"), redis.call("PEXPIRETIME", "key3{t}")}
+        } 3 key1{t} key2{t} key3{t}]
+
+        # Can get the expiration time and they are all equal.
+        assert_morethan [lindex $res 0] 0
+        assert_equal [lindex $res 0] [lindex $res 1]
+    }
+
     r debug set-disable-deny-scripts 0
+}
+
+start_server {tags {"scripting"}} {
+    test "Test script flush will not leak memory - script:$is_eval" {
+        r flushall
+        r script flush
+        r function flush
+
+        # This is a best-effort test to check we don't leak some resources on
+        # script flush and function flush commands. For lua vm, we create a
+        # jemalloc thread cache. On each script flush command, thread cache is
+        # destroyed and we create a new one. In this test, running script flush
+        # many times to verify there is no increase in the memory usage while
+        # re-creating some of the resources for lua vm.
+        set used_memory [s used_memory]
+        set allocator_allocated [s allocator_allocated]
+
+        r multi
+        for {set j 1} {$j <= 500} {incr j} {
+            if {$is_eval} {
+                r SCRIPT FLUSH
+            } else {
+                r FUNCTION FLUSH
+            }
+        }
+        r exec
+
+        # Verify used memory is not (much) higher.
+        assert_lessthan [s used_memory] [expr $used_memory*1.5]
+        assert_lessthan [s allocator_allocated] [expr $allocator_allocated*1.5]
+    }
+
+    test "Verify Lua performs GC correctly after script loading" {
+        set dummy_script "--[string repeat x 10]\nreturn "
+        set n 50000
+        for {set i 0} {$i < $n} {incr i} {
+            set script "$dummy_script[format "%06d" $i]"
+            if {$is_eval} {
+                r script load $script
+            } else {
+                r function load "#!lua name=test$i\nredis.register_function('test$i', function(KEYS, ARGV)\n $script \nend)"
+            }
+        }
+
+        if {$is_eval} {
+            assert_lessthan [s used_memory_lua] 17500000
+        } else {
+            assert_lessthan [s used_memory_vm_functions] 14500000
+        }
+    }
 }
 } ;# foreach is_eval
 
@@ -1740,6 +2104,14 @@ start_server {tags {"scripting"}} {
             } 1 x
 
             r replicaof [srv -1 host] [srv -1 port]
+
+            # To avoid -LOADING reply, wait until replica syncs with master.
+            wait_for_condition 50 100 {
+                [s master_link_status] eq {up}
+            } else {
+                fail "Replica did not sync in time."
+            }
+
             assert_error {EXECABORT Transaction discarded because of: READONLY *} {$rr exec}
             assert_error {READONLY You can't write against a read only replica. script: *} {$rr2 exec}
             $rr close
@@ -2049,5 +2421,30 @@ start_server {tags {"scripting"}} {
             } 0
         ] {asdf}
     }
-}
 
+    test "LUA test trim string as expected" {
+        # this test may fail if we use different memory allocator than jemalloc, as libc for example may keep the old size on realloc.
+        if {[string match {*jemalloc*} [s mem_allocator]]} {
+            # test that when using LUA cache mechanism, if there is free space in the argv array, the string is trimmed.
+            r set foo [string repeat "a" 45]
+            set expected_memory [r memory usage foo]
+
+            # Jemalloc will allocate for the requested 63 bytes, 80 bytes.
+            # We can't test for larger sizes because LUA_CMD_OBJCACHE_MAX_LEN is 64.
+            # This value will be recycled to be used in the next argument.
+            # We use SETNX to avoid saving the string which will prevent us to reuse it in the next command.
+            r eval {
+                return redis.call("SETNX", "foo", string.rep("a", 63))
+            } 0
+
+            # Jemalloc will allocate for the request 45 bytes, 56 bytes.
+            # we can't test for smaller sizes because OBJ_ENCODING_EMBSTR_SIZE_LIMIT is 44 where no trim is done.
+            r eval {
+                return redis.call("SET", "foo", string.rep("a", 45))
+            } 0
+
+            # Assert the string has been trimmed and the 80 bytes from the previous alloc were not kept.
+            assert { [r memory usage foo] <= $expected_memory};
+        }
+    }
+}
