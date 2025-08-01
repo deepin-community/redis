@@ -6,3 +6,4 @@ debian-packaging/0001-Set-Debian-configuration-defaults.patch
 0005-CVE-2025-32023.patch
 0006-CVE-2025-48367.patch
 0007-Add-Redis-ver.-REDIS_VERSION-to-LOLWUT-8-output-as-a.patch
+0008-Add-sw64-support.patch
