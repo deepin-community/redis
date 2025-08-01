@@ -1,8 +1,245 @@
-redis (5:7.0.15-3deepin1) unstable; urgency=medium
+redis (5:8.0.2-3) unstable; urgency=medium
 
-  * feat: add sw64 support.
+  * Add a patch to re-add "Redis ver. $REDIS_VERSION" output to the LOLWUT
+    ~Easter Egg command output as a some testsuites were relying on it
+    existing. This upstream change was made in 8.0.2, not in 8.0.0.
 
- -- hudeng <hudeng@deepin.org>  Wed, 04 Jun 2025 16:26:29 +0800
+ -- Chris Lamb <lamby@debian.org>  Mon, 14 Jul 2025 09:47:32 -0700
+
+redis (5:8.0.2-2) unstable; urgency=high
+
+  * CVE-2025-32023: An authenticated user may have used a specially-crafted
+    string to trigger a stack/heap out-of-bounds write during hyperloglog
+    operations, potentially leading to remote code execution. Installations
+    that used Redis' ACL system to restrict hyperloglog "HLL" commands are
+    unaffected by this issue. (Closes: #1108975)
+  * CVE-2025-48367: An unauthenticated connection could have caused repeated IP
+    protocol errors, leading to client starvation and ultimately become a
+    Denial of Service (DoS) attack. (Closes: #1108981)
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 08 Jul 2025 14:02:33 -0700
+
+redis (5:8.0.2-1) unstable; urgency=medium
+
+  * New upstream security release:
+
+    - CVE-2025-27151: Fix an stack-based buffer overflow in redis-check-aof
+      caused by the use of memcpy with strlen(filepath) when copying a
+      user-supplied file path into a fixed-size stack buffer. This allowed an
+      attacker to overflow the stack and potentially achieve arbitrary code
+      execution. (Closes: #1106822)
+
+  * Update debian/watch to consider 8.x versions again after the recent
+    licensing change.
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 30 May 2025 12:05:58 -0700
+
+redis (5:8.0.0-2) unstable; urgency=medium
+
+  * Upload 8.x series to unstable after relicensing; we should always prefer to
+    ship the latest upstream version, especially given Debian's support
+    timelines.
+  * Drop all CVE-related patches; applied upstream.
+  * Update debian/gbp.conf.
+
+ -- Chris Lamb <lamby@debian.org>  Mon, 12 May 2025 14:43:28 -0700
+
+redis (5:8.0.0-1) experimental; urgency=medium
+
+  * New upstream release under new AGPL-3 licensing scheme.
+    - Update debian/copyright.
+    - Drop all CVE-related patches; applied upstream.
+    - Update and simplify Debian's USE_SYSTEM_JEMALLOC patch.
+  * Pass CXXFLAGS when compiling fast_float so that hardening flags are
+    correctly passed to this dependency.
+  * Refresh patches.
+  * Drop unversioned Depends on Essential: yes package sysvinit-utils.
+  * Build-Depend on pkgconf over pkg-config.
+  * Bump Standards-Version to 4.7.2.
+
+ -- Chris Lamb <lamby@debian.org>  Sun, 11 May 2025 15:23:26 -0700
+
+redis (5:7.2.5-3) experimental; urgency=high
+
+  * Fix two security vulnerabilities:
+
+    - CVE-2024-46981: An authenticated user could have used a specially-crafted
+      Lua script to manipulate the garbage collector and potentially lead to
+      remote code execution.
+
+    * CVE-2024-51741: An authenticated user with sufficient privileges may have
+      created a malformed ACL selector which, when accessed, would have
+      triggered a server panic and subsequent denial of service.
+
+    (Closes: #1092370)
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 21 Jan 2025 10:00:03 +0000
+
+redis (5:7.2.5-2) experimental; urgency=high
+
+  * Fix three new security vulnerabilities:
+
+    - CVE-2024-31227: An authenticated with sufficient privileges could have
+      created a malformed ACL selector which, when accessed, triggered a server
+      panic and subsequent denial of service.
+
+    - CVE-2024-31228: Authenticated users could have triggered a
+      denial-of-service by using specially crafted, long string match patterns
+      on supported commands such as `KEYS`, `SCAN`, `PSUBSCRIBE`, `FUNCTION
+      LIST`, `COMMAND | LIST` and ACL definitions. Matching of extremely long
+      patterns may have resulted in unbounded recursion, leading to stack overflow
+      and process crash.
+
+    - CVE-2024-31449: An authenticated user may have used a specially crafted
+      Lua script to trigger a stack buffer overflow in the bit library, which
+      may have potentially led to remote code execution.
+
+    (Closes: #1084805)
+
+ -- Chris Lamb <lamby@debian.org>  Wed, 09 Oct 2024 13:51:24 -0700
+
+redis (5:7.2.5-1) experimental; urgency=medium
+
+  * New upstream [BSD-licensed] release.
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 04 Jun 2024 08:35:47 +0100
+
+redis (5:7.2.4-1) experimental; urgency=medium
+
+  * New upstream security release:
+
+    - CVE-2023-41056: In some cases, Redis may incorrectly handle resizing of
+      memory buffers which can result in incorrect accounting of buffer sizes
+      and lead to heap overflow and potential remote code execution.  (Closes:
+      #1060316)
+
+    - For more information, please see:
+      <https://raw.githubusercontent.com/redis/redis/7.2/00-RELEASENOTES>
+
+  * Refresh patches.
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 09 Jan 2024 14:29:59 +0000
+
+redis (5:7.2.3-1) experimental; urgency=medium
+
+  * New upstream release.
+
+ -- Chris Lamb <lamby@debian.org>  Sat, 04 Nov 2023 10:20:29 +0100
+
+redis (5:7.2.2-2) experimental; urgency=medium
+
+  * Drop ProcSubset=pid hardening flag from the systemd unit files it appears
+    to cause crashes with memory allocation errors. A huge thanks to Arnaud
+    Rebillout <arnaudr@kali.org> for the extensive investigation.
+    (Closes: #1055039)
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 31 Oct 2023 16:44:01 +0100
+
+redis (5:7.2.2-1) experimental; urgency=high
+
+  * New upstream security release:
+
+    - CVE-2023-45145: On startup, Redis began listening on a Unix socket before
+      adjusting its permissions to the user-provided configuration. If a
+      permissive umask(2) was used, this created a race condition that enabled,
+      during a short period of time, another process to establish an otherwise
+      unauthorized connection. (Closes: #1054225)
+
+  * Refresh patches.
+
+ -- Chris Lamb <lamby@debian.org>  Thu, 19 Oct 2023 15:59:56 +0100
+
+redis (5:7.2.1-2) experimental; urgency=medium
+
+  * Only install systemd units once. Thanks, Helmut! (Closes: #1054091)
+
+ -- Chris Lamb <lamby@debian.org>  Tue, 17 Oct 2023 11:21:34 +0100
+
+redis (5:7.2.1-1) experimental; urgency=medium
+
+  * New upstream security release:
+
+    - CVE-2023-41053: Redis did not correctly identify keys accessed by
+      `SORT_RO`, and as a result Redis may grant users executing this command
+      access to keys that are not explicitly authorized by the ACL
+      configuration. (Closes: #1051512)
+
+    <https://raw.githubusercontent.com/redis/redis/7.2/00-RELEASENOTES>
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 08 Sep 2023 14:13:40 -0700
+
+redis (5:7.2.0-2) experimental; urgency=medium
+
+  * Try and clean up better. (Closes: #1047506)
+  * Replace lsb-base dependencies with sysvinit-utils.
+  * Drop very old debian/NEWS entry.
+
+ -- Chris Lamb <lamby@debian.org>  Thu, 24 Aug 2023 10:30:17 -0700
+
+redis (5:7.2.0-1) experimental; urgency=medium
+
+  * New upstream stable release.
+    <https://raw.githubusercontent.com/redis/redis/7.2/00-RELEASENOTES>
+  * Refresh patches.
+
+ -- Chris Lamb <lamby@debian.org>  Fri, 18 Aug 2023 14:17:31 -0400
+
+redis (5:7.2-rc3-1) experimental; urgency=high
+
+  * New upstream security release.
+    <https://raw.githubusercontent.com/redis/redis/7.2/00-RELEASENOTES>
+
+    - CVE-2022-24834: A specially-crafted Lua script executing in Redis could
+      have triggered a heap overflow in the cjson and cmsgpack libraries and
+      result in heap corruption and potentially remote code execution. The
+      problem exists in all versions of Redis with Lua scripting support and
+      affects only authenticated/authorised users.
+
+    - CVE-2023-36824: Extracting key names from a command and a list of
+      arguments may, in some cases, have triggered a heap overflow and result
+      in reading random heap memory, heap corruption and potentially remote
+      code execution. (Specifically using COMMAND GETKEYS* and validation of
+      key names in ACL rules). (Closes: #1040879)
+
+  * Refresh patches
+
+ -- Chris Lamb <lamby@debian.org>  Wed, 12 Jul 2023 09:57:10 +0100
+
+redis (5:7.2-rc2-1) experimental; urgency=medium
+
+  * New upstream release.
+    <https://raw.githubusercontent.com/redis/redis/7.2/00-RELEASENOTES>
+  * Refresh patches.
+
+ -- Chris Lamb <lamby@debian.org>  Mon, 29 May 2023 07:03:00 -0400
+
+redis (5:7.2-rc1-1) experimental; urgency=medium
+
+  * New upstream security release.
+
+    - CVE-2023-28856: Authenticated users could have used the HINCRBYFLOAT
+      command to create an invalid hash field that will crash the Redis server
+      on access. (Closes: #1034613)
+
+    For more information, please see:
+    <https://raw.githubusercontent.com/redis/redis/7.0/00-RELEASENOTES>
+
+ -- Chris Lamb <lamby@debian.org>  Thu, 20 Apr 2023 07:35:03 +0100
+
+redis (5:7.2~rc1-1) experimental; urgency=medium
+
+  * New upstream experimental 7.2 release.
+  * Refresh patches.
+
+ -- Chris Lamb <lamby@debian.org>  Sat, 25 Mar 2023 10:07:53 +0000
+
+redis (5:7.0.15-3.1) unstable; urgency=medium
+
+  * Non-maintainer upload.
+  * CVE-2025-21605: Limit output buffer for unauthenticated clients
+    (Closes: #1104010)
+
+ -- Adrian Bunk <bunk@debian.org>  Fri, 09 May 2025 16:03:22 +0300
 
 redis (5:7.0.15-3) unstable; urgency=high
 

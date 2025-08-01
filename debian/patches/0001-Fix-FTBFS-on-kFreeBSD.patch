@@ -7,10 +7,10 @@ Subject: Fix FTBFS on kFreeBSD
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/src/fmacros.h b/src/fmacros.h
-index a97d21a..4b2d895 100644
+index d05230d..3d6b7c9 100644
 --- a/src/fmacros.h
 +++ b/src/fmacros.h
-@@ -41,7 +41,7 @@
+@@ -21,7 +21,7 @@
  #define _ALL_SOURCE
  #endif
  

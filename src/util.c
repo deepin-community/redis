@@ -1,5 +1,6 @@
 /*
- * Copyright (c) 2009-2012, Salvatore Sanfilippo <antirez at gmail dot com>
+ * Copyright (c) 2009-current, Redis Ltd.
+ * Copyright (c) 2012, Twitter, Inc.
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -28,6 +29,8 @@
  */
 
 #include "fmacros.h"
+#include "fpconv_dtoa.h"
+#include "fast_float_strtod.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -49,10 +52,22 @@
 #include "sha256.h"
 #include "config.h"
 
+#define UNUSED(x) ((void)(x))
+
+/* Selectively define static_assert. Attempt to avoid include server.h in this file. */
+#ifndef static_assert
+#define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
+#endif
+
+static_assert(UINTPTR_MAX == 0xffffffffffffffff || UINTPTR_MAX == 0xffffffff, "Unsupported pointer size");
+
 /* Glob-style pattern matching. */
 static int stringmatchlen_impl(const char *pattern, int patternLen,
-        const char *string, int stringLen, int nocase, int *skipLongerMatches)
+        const char *string, int stringLen, int nocase, int *skipLongerMatches, int nesting)
 {
+    /* Protection against abusive patterns. */
+    if (nesting > 1000) return 0;
+
     while(patternLen && stringLen) {
         switch(pattern[0]) {
         case '*':
@@ -64,7 +79,7 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
                 return 1; /* match */
             while(stringLen) {
                 if (stringmatchlen_impl(pattern+1, patternLen-1,
-                            string, stringLen, nocase, skipLongerMatches))
+                            string, stringLen, nocase, skipLongerMatches, nesting+1))
                     return 1; /* match */
                 if (*skipLongerMatches)
                     return 0; /* no match */
@@ -94,23 +109,23 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
 
             pattern++;
             patternLen--;
-            not = pattern[0] == '^';
+            not = patternLen && pattern[0] == '^';
             if (not) {
                 pattern++;
                 patternLen--;
             }
             match = 0;
             while(1) {
-                if (pattern[0] == '\\' && patternLen >= 2) {
+                if (patternLen >= 2 && pattern[0] == '\\') {
                     pattern++;
                     patternLen--;
                     if (pattern[0] == string[0])
                         match = 1;
-                } else if (pattern[0] == ']') {
-                    break;
                 } else if (patternLen == 0) {
                     pattern--;
                     patternLen++;
+                    break;
+                } else if (pattern[0] == ']') {
                     break;
                 } else if (patternLen >= 3 && pattern[1] == '-') {
                     int start = pattern[0];
@@ -171,7 +186,7 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
         pattern++;
         patternLen--;
         if (stringLen == 0) {
-            while(*pattern == '*') {
+            while(patternLen && *pattern == '*') {
                 pattern++;
                 patternLen--;
             }
@@ -183,10 +198,47 @@ static int stringmatchlen_impl(const char *pattern, int patternLen,
     return 0;
 }
 
+/* 
+ * glob-style pattern matching to check if a given pattern fully includes 
+ * the prefix of a string. For the match to succeed, the pattern must end with 
+ * an unescaped '*' character.
+ * 
+ * Returns: 1 if the `pattern` fully matches the `prefixStr`. Returns 0 otherwise.
+ */
+int prefixmatch(const char *pattern, int patternLen,
+                const char *prefixStr, int prefixStrLen, int nocase) {
+    int skipLongerMatches = 0;
+    
+    /* Step 1: Verify if the pattern matches the prefix string completely. */
+    if (!stringmatchlen_impl(pattern, patternLen, prefixStr, prefixStrLen, nocase, &skipLongerMatches, 0))
+        return 0;
+
+    /* Step 2: Verify that the pattern ends with an unescaped '*', indicating
+     * it can match any suffix of the string beyond the prefix. This check
+     * remains outside stringmatchlen_impl() to keep its complexity manageable.
+     */
+    if (patternLen == 0 || pattern[patternLen - 1] != '*' )
+        return 0;
+
+    /* Count backward the number of consecutive backslashes preceding the '*'
+     * to determine if the '*' is escaped. */
+    int backslashCount = 0;
+    for (int i = patternLen - 2; i >= 0; i--) {
+        if (pattern[i] == '\\')
+            ++backslashCount;
+        else
+            break; /* Stop counting when a non-backslash character is found. */
+    }
+
+    /* Return 1 if the '*' is not escaped (i.e., even count), 0 otherwise. */
+    return (backslashCount % 2 == 0);
+}
+
+/* Glob-style pattern matching to a string. */
 int stringmatchlen(const char *pattern, int patternLen,
         const char *string, int stringLen, int nocase) {
     int skipLongerMatches = 0;
-    return stringmatchlen_impl(pattern,patternLen,string,stringLen,nocase,&skipLongerMatches);
+    return stringmatchlen_impl(pattern,patternLen,string,stringLen,nocase,&skipLongerMatches,0);
 }
 
 int stringmatch(const char *pattern, const char *string, int nocase) {
@@ -349,7 +401,7 @@ int ll2string(char *dst, size_t dstlen, long long svalue) {
             value = ((unsigned long long) LLONG_MAX)+1;
         }
         if (dstlen < 2)
-            return 0;
+            goto err;
         negative = 1;
         dst[0] = '-';
         dst++;
@@ -362,6 +414,12 @@ int ll2string(char *dst, size_t dstlen, long long svalue) {
     int length = ull2string(dst, dstlen, value);
     if (length == 0) return 0;
     return length + negative;
+
+err:
+    /* force add Null termination */
+    if (dstlen > 0)
+        dst[0] = '\0';
+    return 0;
 }
 
 /* Convert a unsigned long long into a string. Returns the number of
@@ -382,7 +440,7 @@ int ull2string(char *dst, size_t dstlen, unsigned long long value) {
 
     /* Check length. */
     uint32_t length = digits10(value);
-    if (length >= dstlen) return 0;
+    if (length >= dstlen) goto err;;
 
     /* Null term. */
     uint32_t next = length - 1;
@@ -403,8 +461,12 @@ int ull2string(char *dst, size_t dstlen, unsigned long long value) {
         dst[next] = digits[i + 1];
         dst[next - 1] = digits[i];
     }
-
     return length;
+err:
+    /* force add Null termination */
+    if (dstlen > 0)
+        dst[0] = '\0';
+    return 0;
 }
 
 /* Convert a string into a long long. Returns 1 if the string could be parsed
@@ -521,6 +583,43 @@ int string2l(const char *s, size_t slen, long *lval) {
     return 1;
 }
 
+/* return 1 if c>= start && c <= end, 0 otherwise*/
+static int safe_is_c_in_range(char c, char start, char end) {
+    if (c >= start && c <= end) return 1;
+    return 0;
+}
+
+static int base_16_char_type(char c) {
+    if (safe_is_c_in_range(c, '0', '9')) return 0;
+    if (safe_is_c_in_range(c, 'a', 'f')) return 1;
+    if (safe_is_c_in_range(c, 'A', 'F')) return 2;
+    return -1;
+}
+
+/** This is an async-signal safe version of string2l to convert unsigned long to string.
+ * The function translates @param src until it reaches a value that is not 0-9, a-f or A-F, or @param we read slen characters.
+ * On successes writes the result to @param result_output and returns 1.
+ * if the string represents an overflow value, return -1. */
+int string2ul_base16_async_signal_safe(const char *src, size_t slen, unsigned long *result_output) {
+    static char ascii_to_dec[] = {'0', 'a' - 10, 'A' - 10};
+
+    int char_type = 0;
+    size_t curr_char_idx = 0;
+    unsigned long result = 0;
+    int base = 16;
+    while ((-1 != (char_type = base_16_char_type(src[curr_char_idx]))) &&
+            curr_char_idx < slen) {
+        unsigned long curr_val = src[curr_char_idx] - ascii_to_dec[char_type];
+        if ((result > ULONG_MAX / base) || (result > (ULONG_MAX - curr_val)/base)) /* Overflow. */
+            return -1;
+        result = result * base + curr_val;
+        ++curr_char_idx;
+    }
+
+    *result_output = result;
+    return 1;
+}
+
 /* Convert a string into a double. Returns 1 if the string could be parsed
  * into a (non-overflowing) double, 0 otherwise. The value will be set to
  * the parsed value when appropriate.
@@ -561,13 +660,22 @@ int string2ld(const char *s, size_t slen, long double *dp) {
 int string2d(const char *s, size_t slen, double *dp) {
     errno = 0;
     char *eptr;
-    *dp = strtod(s, &eptr);
-    if (slen == 0 ||
-        isspace(((const char*)s)[0]) ||
-        (size_t)(eptr-(char*)s) != slen ||
+    /* Fast path to reject empty strings, or strings starting by space explicitly */
+    if (unlikely(slen == 0 ||
+        isspace(((const char*)s)[0])))
+        return 0;
+    *dp = fast_float_strtod(s, &eptr);
+    /* If `fast_float_strtod` didn't consume full input, try `strtod`
+     * Given fast_float does not support hexadecimal strings representation */
+    if (unlikely((size_t)(eptr - (char*)s) != slen)) {
+        char *fallback_eptr;
+        *dp = strtod(s, &fallback_eptr);
+        if ((size_t)(fallback_eptr - (char*)s) != slen) return 0;
+    }
+    if (unlikely(errno == EINVAL ||
         (errno == ERANGE &&
             (*dp == HUGE_VAL || *dp == -HUGE_VAL || fpclassify(*dp) == FP_ZERO)) ||
-        isnan(*dp))
+        isnan(*dp)))
         return 0;
     return 1;
 }
@@ -609,8 +717,13 @@ int double2ll(double d, long long *out) {
  * into a listpack representing a sorted set. */
 int d2string(char *buf, size_t len, double value) {
     if (isnan(value)) {
+        /* Libc in some systems will format nan in a different way,
+         * like nan, -nan, NAN, nan(char-sequence).
+         * So we normalize it and create a single nan form in an explicit way. */
         len = snprintf(buf,len,"nan");
     } else if (isinf(value)) {
+        /* Libc in odd systems (Hi Solaris!) will format infinite in a
+         * different way, so better to handle it in an explicit way. */
         if (value < 0)
             len = snprintf(buf,len,"-inf");
         else
@@ -626,8 +739,10 @@ int d2string(char *buf, size_t len, double value) {
         /* Integer printing function is much faster, check if we can safely use it. */
         if (double2ll(value, &lvalue))
             len = ll2string(buf,len,lvalue);
-        else
-            len = snprintf(buf,len,"%.17g",value);
+        else {
+            len = fpconv_dtoa(value, buf);
+            buf[len] = '\0';
+        }
     }
 
     return len;
@@ -773,7 +888,7 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
     if (isinf(value)) {
         /* Libc in odd systems (Hi Solaris!) will format infinite in a
          * different way, so better to handle it in an explicit way. */
-        if (len < 5) return 0; /* No room. 5 is "-inf\0" */
+        if (len < 5) goto err; /* No room. 5 is "-inf\0" */
         if (value > 0) {
             memcpy(buf,"inf",3);
             l = 3;
@@ -781,15 +896,22 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
             memcpy(buf,"-inf",4);
             l = 4;
         }
+    } else if (isnan(value)) {
+        /* Libc in some systems will format nan in a different way,
+         * like nan, -nan, NAN, nan(char-sequence).
+         * So we normalize it and create a single nan form in an explicit way. */
+        if (len < 4) goto err; /* No room. 4 is "nan\0" */
+        memcpy(buf, "nan", 3);
+        l = 3;
     } else {
         switch (mode) {
         case LD_STR_AUTO:
             l = snprintf(buf,len,"%.17Lg",value);
-            if (l+1 > len) return 0; /* No room. */
+            if (l+1 > len) goto err;; /* No room. */
             break;
         case LD_STR_HEX:
             l = snprintf(buf,len,"%La",value);
-            if (l+1 > len) return 0; /* No room. */
+            if (l+1 > len) goto err; /* No room. */
             break;
         case LD_STR_HUMAN:
             /* We use 17 digits precision since with 128 bit floats that precision
@@ -798,7 +920,7 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
              * decimal numbers will be represented in a way that when converted
              * back into a string are exactly the same as what the user typed.) */
             l = snprintf(buf,len,"%.17Lf",value);
-            if (l+1 > len) return 0; /* No room. */
+            if (l+1 > len) goto err; /* No room. */
             /* Now remove trailing zeroes after the '.' */
             if (strchr(buf,'.') != NULL) {
                 char *p = buf+l-1;
@@ -813,11 +935,16 @@ int ld2string(char *buf, size_t len, long double value, ld2string_mode mode) {
                 l = 1;
             }
             break;
-        default: return 0; /* Invalid mode. */
+        default: goto err; /* Invalid mode. */
         }
     }
     buf[l] = '\0';
     return l;
+err:
+    /* force add Null termination */
+    if (len > 0)
+        buf[0] = '\0';
+    return 0;
 }
 
 /* Get random bytes, attempts to get an initial seed from /dev/urandom and
@@ -961,10 +1088,9 @@ long getTimeZone(void) {
 #if defined(__linux__) || defined(__sun)
     return timezone;
 #else
-    struct timeval tv;
     struct timezone tz;
 
-    gettimeofday(&tv, &tz);
+    gettimeofday(NULL, &tz);
 
     return tz.tz_minuteswest * 60L;
 #endif
@@ -1030,6 +1156,7 @@ int dirRemove(char *dname) {
 
         if (S_ISDIR(stat_entry.st_mode) != 0) {
             if (dirRemove(full_path) == -1) {
+                closedir(dir);
                 return -1;
             }
             continue;
@@ -1097,66 +1224,274 @@ int fsyncFileDir(const char *filename) {
         errno = save_errno;
         return -1;
     }
-    
+
     close(dir_fd);
     return 0;
 }
 
+ /* free OS pages backed by file */
+int reclaimFilePageCache(int fd, size_t offset, size_t length) {
+#ifdef HAVE_FADVISE
+    int ret = posix_fadvise(fd, offset, length, POSIX_FADV_DONTNEED);
+    if (ret) {
+        errno = ret;
+        return -1;
+    }
+    return 0;
+#else
+    UNUSED(fd);
+    UNUSED(offset);
+    UNUSED(length);
+    return 0;
+#endif
+}
+
+/** An async signal safe version of fgets().
+ * Has the same behaviour as standard fgets(): reads a line from fd and stores it into the dest buffer.
+ * It stops when either (buff_size-1) characters are read, the newline character is read, or the end-of-file is reached,
+ * whichever comes first.
+ *
+ * On success, the function returns the same dest parameter. If the End-of-File is encountered and no characters have
+ * been read, the contents of dest remain unchanged and a null pointer is returned.
+ * If an error occurs, a null pointer is returned. */
+char *fgets_async_signal_safe(char *dest, int buff_size, int fd) {
+    for (int i = 0; i < buff_size; i++) {
+        /* Read one byte */
+        ssize_t bytes_read_count = read(fd, dest + i, 1);
+        /* On EOF or error return NULL */
+        if (bytes_read_count < 1) {
+            return NULL;
+        }
+        /* we found the end of the line. */
+        if (dest[i] == '\n') {
+            break;
+        }
+    }
+    return dest;
+}
+
+static const char HEX[] = "0123456789abcdef";
+
+static char *u2string_async_signal_safe(int _base, uint64_t val, char *buf) {
+    uint32_t base = (uint32_t) _base;
+    *buf-- = 0;
+    do {
+        *buf-- = HEX[val % base];
+    } while ((val /= base) != 0);
+    return buf + 1;
+}
+
+static char *i2string_async_signal_safe(int base, int64_t val, char *buf) {
+    char *orig_buf = buf;
+    const int32_t is_neg = (val < 0);
+    *buf-- = 0;
+
+    if (is_neg) {
+        val = -val;
+    }
+    if (is_neg && base == 16) {
+        int ix;
+        val -= 1;
+        for (ix = 0; ix < 16; ++ix)
+            buf[-ix] = '0';
+    }
+
+    do {
+        *buf-- = HEX[val % base];
+    } while ((val /= base) != 0);
+
+    if (is_neg && base == 10) {
+        *buf-- = '-';
+    }
+
+    if (is_neg && base == 16) {
+        int ix;
+        buf = orig_buf - 1;
+        for (ix = 0; ix < 16; ++ix, --buf) {
+            /* *INDENT-OFF* */
+            switch (*buf) {
+            case '0': *buf = 'f'; break;
+            case '1': *buf = 'e'; break;
+            case '2': *buf = 'd'; break;
+            case '3': *buf = 'c'; break;
+            case '4': *buf = 'b'; break;
+            case '5': *buf = 'a'; break;
+            case '6': *buf = '9'; break;
+            case '7': *buf = '8'; break;
+            case '8': *buf = '7'; break;
+            case '9': *buf = '6'; break;
+            case 'a': *buf = '5'; break;
+            case 'b': *buf = '4'; break;
+            case 'c': *buf = '3'; break;
+            case 'd': *buf = '2'; break;
+            case 'e': *buf = '1'; break;
+            case 'f': *buf = '0'; break;
+            }
+            /* *INDENT-ON* */
+        }
+    }
+    return buf + 1;
+}
+
+static const char *check_longlong_async_signal_safe(const char *fmt, int32_t *have_longlong) {
+    *have_longlong = 0;
+    if (*fmt == 'l') {
+        fmt++;
+        if (*fmt != 'l') {
+            *have_longlong = (sizeof(long) == sizeof(int64_t));
+        } else {
+            fmt++;
+            *have_longlong = 1;
+        }
+    }
+    return fmt;
+}
+
+int vsnprintf_async_signal_safe(char *to, size_t size, const char *format, va_list ap) {
+    char *start = to;
+    char *end = start + size - 1;
+    for (; *format; ++format) {
+        int32_t have_longlong = 0;
+        if (*format != '%') {
+            if (to == end) { /* end of buffer */
+                break;
+            }
+            *to++ = *format; /* copy ordinary char */
+            continue;
+        }
+        ++format; /* skip '%' */
+
+        format = check_longlong_async_signal_safe(format, &have_longlong);
+
+        switch (*format) {
+        case 'd':
+        case 'i':
+        case 'u':
+        case 'x':
+        case 'p':
+            {
+                int64_t ival = 0;
+                uint64_t uval = 0;
+                if (*format == 'p')
+                    have_longlong = (sizeof(void *) == sizeof(uint64_t));
+                if (have_longlong) {
+                    if (*format == 'u') {
+                        uval = va_arg(ap, uint64_t);
+                    } else {
+                        ival = va_arg(ap, int64_t);
+                    }
+                } else {
+                    if (*format == 'u') {
+                        uval = va_arg(ap, uint32_t);
+                    } else {
+                        ival = va_arg(ap, int32_t);
+                    }
+                }
+
+                {
+                    char buff[22];
+                    const int base = (*format == 'x' || *format == 'p') ? 16 : 10;
+
+/* *INDENT-OFF* */
+                    char *val_as_str = (*format == 'u') ?
+                        u2string_async_signal_safe(base, uval, &buff[sizeof(buff) - 1]) :
+                        i2string_async_signal_safe(base, ival, &buff[sizeof(buff) - 1]);
+/* *INDENT-ON* */
+
+                    /* Strip off "ffffffff" if we have 'x' format without 'll' */
+                    if (*format == 'x' && !have_longlong && ival < 0) {
+                        val_as_str += 8;
+                    }
+
+                    while (*val_as_str && to < end) {
+                        *to++ = *val_as_str++;
+                    }
+                    continue;
+                }
+            }
+        case 's':
+            {
+                const char *val = va_arg(ap, char *);
+                if (!val) {
+                    val = "(null)";
+                }
+                while (*val && to < end) {
+                    *to++ = *val++;
+                }
+                continue;
+            }
+        }
+    }
+    *to = 0;
+    return (int)(to - start);
+}
+
+int snprintf_async_signal_safe(char *to, size_t n, const char *fmt, ...) {
+    int result;
+    va_list args;
+    va_start(args, fmt);
+    result = vsnprintf_async_signal_safe(to, n, fmt, args);
+    va_end(args);
+    return result;
+}
+
 #ifdef REDIS_TEST
 #include <assert.h>
+#include <sys/mman.h>
+#include "testhelp.h"
 
 static void test_string2ll(void) {
     char buf[32];
     long long v;
 
     /* May not start with +. */
-    strcpy(buf,"+1");
+    redis_strlcpy(buf,"+1",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 0);
 
     /* Leading space. */
-    strcpy(buf," 1");
+    redis_strlcpy(buf," 1",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 0);
 
     /* Trailing space. */
-    strcpy(buf,"1 ");
+    redis_strlcpy(buf,"1 ",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 0);
 
     /* May not start with 0. */
-    strcpy(buf,"01");
+    redis_strlcpy(buf,"01",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 0);
 
-    strcpy(buf,"-1");
+    redis_strlcpy(buf,"-1",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 1);
     assert(v == -1);
 
-    strcpy(buf,"0");
+    redis_strlcpy(buf,"0",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 1);
     assert(v == 0);
 
-    strcpy(buf,"1");
+    redis_strlcpy(buf,"1",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 1);
     assert(v == 1);
 
-    strcpy(buf,"99");
+    redis_strlcpy(buf,"99",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 1);
     assert(v == 99);
 
-    strcpy(buf,"-99");
+    redis_strlcpy(buf,"-99",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 1);
     assert(v == -99);
 
-    strcpy(buf,"-9223372036854775808");
+    redis_strlcpy(buf,"-9223372036854775808",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 1);
     assert(v == LLONG_MIN);
 
-    strcpy(buf,"-9223372036854775809"); /* overflow */
+    redis_strlcpy(buf,"-9223372036854775809",sizeof(buf)); /* overflow */
     assert(string2ll(buf,strlen(buf),&v) == 0);
 
-    strcpy(buf,"9223372036854775807");
+    redis_strlcpy(buf,"9223372036854775807",sizeof(buf));
     assert(string2ll(buf,strlen(buf),&v) == 1);
     assert(v == LLONG_MAX);
 
-    strcpy(buf,"9223372036854775808"); /* overflow */
+    redis_strlcpy(buf,"9223372036854775808",sizeof(buf)); /* overflow */
     assert(string2ll(buf,strlen(buf),&v) == 0);
 }
 
@@ -1165,48 +1500,105 @@ static void test_string2l(void) {
     long v;
 
     /* May not start with +. */
-    strcpy(buf,"+1");
+    redis_strlcpy(buf,"+1",sizeof(buf));
     assert(string2l(buf,strlen(buf),&v) == 0);
 
     /* May not start with 0. */
-    strcpy(buf,"01");
+    redis_strlcpy(buf,"01",sizeof(buf));
     assert(string2l(buf,strlen(buf),&v) == 0);
 
-    strcpy(buf,"-1");
+    redis_strlcpy(buf,"-1",sizeof(buf));
     assert(string2l(buf,strlen(buf),&v) == 1);
     assert(v == -1);
 
-    strcpy(buf,"0");
+    redis_strlcpy(buf,"0",sizeof(buf));
     assert(string2l(buf,strlen(buf),&v) == 1);
     assert(v == 0);
 
-    strcpy(buf,"1");
+    redis_strlcpy(buf,"1",sizeof(buf));
     assert(string2l(buf,strlen(buf),&v) == 1);
     assert(v == 1);
 
-    strcpy(buf,"99");
+    redis_strlcpy(buf,"99",sizeof(buf));
     assert(string2l(buf,strlen(buf),&v) == 1);
     assert(v == 99);
 
-    strcpy(buf,"-99");
+    redis_strlcpy(buf,"-99",sizeof(buf));
     assert(string2l(buf,strlen(buf),&v) == 1);
     assert(v == -99);
 
 #if LONG_MAX != LLONG_MAX
-    strcpy(buf,"-2147483648");
+    redis_strlcpy(buf,"-2147483648",sizeof(buf));
     assert(string2l(buf,strlen(buf),&v) == 1);
     assert(v == LONG_MIN);
 
-    strcpy(buf,"-2147483649"); /* overflow */
+    redis_strlcpy(buf,"-2147483649",sizeof(buf)); /* overflow */
     assert(string2l(buf,strlen(buf),&v) == 0);
 
-    strcpy(buf,"2147483647");
+    redis_strlcpy(buf,"2147483647",sizeof(buf));
     assert(string2l(buf,strlen(buf),&v) == 1);
     assert(v == LONG_MAX);
 
-    strcpy(buf,"2147483648"); /* overflow */
+    redis_strlcpy(buf,"2147483648",sizeof(buf)); /* overflow */
     assert(string2l(buf,strlen(buf),&v) == 0);
 #endif
+}
+
+static void test_string2d(void) {
+    char buf[1024];
+    double v;
+
+    /* Valid hexadecimal value. */
+    redis_strlcpy(buf,"0x0p+0",sizeof(buf));
+    assert(string2d(buf,strlen(buf),&v) == 1);
+    assert(v == 0.0);
+
+    redis_strlcpy(buf,"0x1p+0",sizeof(buf));
+    assert(string2d(buf,strlen(buf),&v) == 1);
+    assert(v == 1.0);
+
+    /* Valid floating-point numbers */
+    redis_strlcpy(buf, "1.5", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == 1.5);
+
+    redis_strlcpy(buf, "-3.14", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == -3.14);
+
+    redis_strlcpy(buf, "2.0e10", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == 2.0e10);
+
+    redis_strlcpy(buf, "1e-3", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == 0.001);
+
+    /* Valid integer */
+    redis_strlcpy(buf, "42", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 1);
+    assert(v == 42.0);
+
+    /* Invalid cases */
+    /* Empty. */
+    redis_strlcpy(buf, "", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 0);
+
+    /* Starting by space. */
+    redis_strlcpy(buf, " 1.23", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 0);
+
+    /* Invalid hexadecimal format. */
+    redis_strlcpy(buf, "0x1.2g", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 0);
+
+    /* Hexadecimal NaN */
+    redis_strlcpy(buf, "0xNan", sizeof(buf));
+    assert(string2d(buf, strlen(buf), &v) == 0);
+
+    /* overflow. */
+    redis_strlcpy(buf,"23456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789123456789",sizeof(buf));
+    assert(string2d(buf,strlen(buf),&v) == 0);
 }
 
 static void test_ll2string(void) {
@@ -1248,6 +1640,17 @@ static void test_ll2string(void) {
     sz = ll2string(buf, sizeof buf, v);
     assert(sz == 19);
     assert(!strcmp(buf, "9223372036854775807"));
+}
+
+static void test_ld2string(void) {
+    char buf[32];
+    long double v;
+    int sz;
+
+    v = 0.0 / 0.0;
+    sz = ld2string(buf, sizeof(buf), v, LD_STR_AUTO);
+    assert(sz == 3);
+    assert(!strcmp(buf, "nan"));
 }
 
 static void test_fixedpoint_d2string(void) {
@@ -1311,7 +1714,44 @@ static void test_fixedpoint_d2string(void) {
     assert(sz == 0);
 }
 
-#define UNUSED(x) (void)(x)
+#if defined(__linux__)
+/* Since fadvise and mincore is only supported in specific platforms like
+ * Linux, we only verify the fadvise mechanism works in Linux */
+static int cache_exist(int fd) {
+    unsigned char flag;
+    void *m = mmap(NULL, 4096, PROT_READ, MAP_SHARED, fd, 0);
+    assert(m);
+    assert(mincore(m, 4096, &flag) == 0);
+    munmap(m, 4096);
+    /* the least significant bit of the byte will be set if the corresponding
+     * page is currently resident in memory */
+    return flag&1;
+}
+
+static void test_reclaimFilePageCache(void) {
+    char *tmpfile = "/tmp/redis-reclaim-cache-test";
+    int fd = open(tmpfile, O_RDWR|O_CREAT, 0644);
+    assert(fd >= 0);
+
+    /* test write file */
+    char buf[4] = "foo";
+    assert(write(fd, buf, sizeof(buf)) > 0);
+    assert(cache_exist(fd));
+    assert(redis_fsync(fd) == 0);
+    assert(reclaimFilePageCache(fd, 0, 0) == 0);
+    assert(!cache_exist(fd));
+
+    /* test read file */
+    assert(pread(fd, buf, sizeof(buf), 0) > 0);
+    assert(cache_exist(fd));
+    assert(reclaimFilePageCache(fd, 0, 0) == 0);
+    assert(!cache_exist(fd));
+
+    unlink(tmpfile);
+    printf("reclaimFilePageCach test is ok\n");
+}
+#endif
+
 int utilTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
@@ -1319,8 +1759,16 @@ int utilTest(int argc, char **argv, int flags) {
 
     test_string2ll();
     test_string2l();
+    test_string2d();
     test_ll2string();
+    test_ld2string();
     test_fixedpoint_d2string();
+#if defined(__linux__)
+    if (!(flags & REDIS_TEST_VALGRIND)) {
+        test_reclaimFilePageCache();
+    }
+#endif
+    printf("Done testing util\n");
     return 0;
 }
 #endif

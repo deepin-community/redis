@@ -1,13 +1,42 @@
 From: Chris Lamb <lamby@debian.org>
 Date: Fri, 30 Oct 2015 10:53:42 +0000
-Subject: Add CPPFLAGS to upstream makefiles
+Subject: Add CPPFLAGS and CXXFLAGS to upstream makefiles
 
+.
 ---
+ deps/fast_float/Makefile    | 2 +-
+ deps/fpconv/Makefile        | 2 +-
  deps/hdr_histogram/Makefile | 2 +-
  deps/linenoise/Makefile     | 2 +-
  src/Makefile                | 2 +-
- 3 files changed, 3 insertions(+), 3 deletions(-)
+ 5 files changed, 5 insertions(+), 5 deletions(-)
 
+diff --git a/deps/fast_float/Makefile b/deps/fast_float/Makefile
+index d3e5d30..92f535f 100644
+--- a/deps/fast_float/Makefile
++++ b/deps/fast_float/Makefile
+@@ -2,7 +2,7 @@
+ CC ?= gcc
+ CXX ?= g++
+ 
+-CFLAGS=-Wall -O3
++CFLAGS=$(shell dpkg-buildflags --get CXXFLAGS) $(shell dpkg-buildflags --get CPPFLAGS)
+ # This avoids loosing the fastfloat specific compile flags when we override the CFLAGS via the main project
+ FASTFLOAT_CFLAGS=-std=c++11 -DFASTFLOAT_ALLOWS_LEADING_PLUS
+ LDFLAGS=
+diff --git a/deps/fpconv/Makefile b/deps/fpconv/Makefile
+index 2654888..64d2ed0 100644
+--- a/deps/fpconv/Makefile
++++ b/deps/fpconv/Makefile
+@@ -2,7 +2,7 @@ STD=
+ WARN= -Wall
+ OPT= -Os
+ 
+-R_CFLAGS= $(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS)
++R_CFLAGS= $(STD) $(WARN) $(OPT) $(DEBUG) $(CFLAGS) $(CPPFLAGS)
+ R_LDFLAGS= $(LDFLAGS)
+ DEBUG= -g
+ 
 diff --git a/deps/hdr_histogram/Makefile b/deps/hdr_histogram/Makefile
 index 28dd93e..3a6413e 100644
 --- a/deps/hdr_histogram/Makefile
@@ -35,10 +64,10 @@ index 1dd894b..12ada21 100644
  
  linenoise.o: linenoise.h linenoise.c
 diff --git a/src/Makefile b/src/Makefile
-index e4f7d90..391fdbc 100644
+index e3a76ed..179a9c4 100644
 --- a/src/Makefile
 +++ b/src/Makefile
-@@ -296,7 +296,7 @@ else
+@@ -335,7 +335,7 @@ else
      endef
  endif
  
