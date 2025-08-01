@@ -1,0 +1,36 @@
+From: Tianyu Chen <sweetyfish@deepin.org>
+Date: Fri, 1 Aug 2025 10:56:33 +0800
+Subject: Add sw64 support
+
+---
+ deps/jemalloc/include/jemalloc/internal/quantum.h | 3 +++
+ src/config.h                                      | 2 +-
+ 2 files changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/deps/jemalloc/include/jemalloc/internal/quantum.h b/deps/jemalloc/include/jemalloc/internal/quantum.h
+index c22d753..7d1f607 100644
+--- a/deps/jemalloc/include/jemalloc/internal/quantum.h
++++ b/deps/jemalloc/include/jemalloc/internal/quantum.h
+@@ -71,6 +71,9 @@
+ #  ifdef __arc__
+ #    define LG_QUANTUM		3
+ #  endif
++#  ifdef __sw_64__
++#    define LG_QUANTUM		4
++#  endif
+ #  ifndef LG_QUANTUM
+ #    error "Unknown minimum alignment for architecture; specify via "
+ 	 "--with-lg-quantum"
+diff --git a/src/config.h b/src/config.h
+index 4733855..f0e5540 100644
+--- a/src/config.h
++++ b/src/config.h
+@@ -214,7 +214,7 @@ void setproctitle(const char *fmt, ...);
+ #if defined(__i386__) || defined(__x86_64__) || defined(__amd64__) || \
+    defined(vax) || defined(ns32000) || defined(sun386) || \
+    defined(MIPSEL) || defined(_MIPSEL) || defined(BIT_ZERO_ON_RIGHT) || \
+-   defined(__alpha__) || defined(__alpha)
++   defined(__alpha__) || defined(__alpha) || defined(__sw_64__)
+ #define BYTE_ORDER    LITTLE_ENDIAN
+ #endif
+ 
