@@ -1,3 +1,10 @@
+redis (5:8.0.2-3deepin2) unstable; urgency=medium
+
+  * Security fix: CVE-2026-21863 - Fix remote DoS with malformed cluster bus
+    message (clusterbus OOB read validation)
+
+ -- deepin-ci-robot <packages@deepin.org>  Thu, 17 Apr 2026 00:00:00 +0800
+
 redis (5:8.0.2-3deepin1) unstable; urgency=medium
 
   * Add sw64 support
