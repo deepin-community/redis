@@ -12,3 +12,4 @@ debian-packaging/0001-Set-Debian-configuration-defaults.patch
 0011-CVE-2025-46817.patch
 0012-CVE-2025-67733.patch
 0013-CVE-2026-21863.patch
+0015-Add-sw64-support.patch
