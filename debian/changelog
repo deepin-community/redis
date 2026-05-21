@@ -1,8 +1,20 @@
-redis (5:8.0.2-3deepin1) unstable; urgency=medium
+redis (5:8.0.2-3+deb13u2) trixie-security; urgency=high
 
-  * Add sw64 support
+  * CVE-2025-67733: RESP protocol injection via Lua error_reply. A user
+    could manipulate data read by a connection by injecting CR/LF
+    sequences into a Redis error reply.
+  * CVE-2026-21863: Remote DoS with malformed Cluster bus message. A peer
+    could send a crafted PING/PONG/MEET packet whose gossip count or
+    ping-extension header exceeds the received packet length, causing
+    out-of-bounds reads and a server crash.
 
- -- Tianyu Chen <sweetyfish@deepin.org>  Fri, 01 Aug 2025 11:03:31 +0800
+ -- Aron Xu <aron@debian.org>  Wed, 13 May 2026 12:00:00 +0800
+
+redis (5:8.0.2-3+deb13u1) trixie-security; urgency=medium
+
+  * CVE-2025-49844 / CVE-2025-46819 / CVE-2025-46818 / CVE-2025-46817
+
+ -- Moritz Mühlenhoff <jmm@debian.org>  Tue, 07 Oct 2025 20:00:58 +0200
 
 redis (5:8.0.2-3) unstable; urgency=medium
 
