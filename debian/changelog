@@ -1,8 +1,41 @@
-redis (5:8.0.2-3+deb13u2deepin1) unstable; urgency=medium
+redis (5:8.0.2-3+deb13u3) trixie-security; urgency=high
 
-  * Add sw64 support
+  * Non-maintainer upload by the Security Team.
+  * CVE-2026-25243: Invalid memory access in RESTORE. The RESTORE
+    command did not properly validate serialized values; an
+    authenticated attacker able to run RESTORE could supply a crafted
+    payload triggering invalid memory access and possibly remote code
+    execution. (Closes: #1147421)
+  * CVE-2026-23631: Lua use-after-free on replicas. An authenticated
+    attacker could exploit the master-replica synchronization mechanism
+    to trigger a use-after-free on replicas where replica-read-only is
+    disabled, potentially leading to remote code execution.
+    (Closes: #1147421)
+  * CVE-2026-23479: Use-after-free in the unblock client flow. The error
+    return from processCommandAndResetClient was not handled when re-
+    executing a blocked command, allowing an authenticated attacker to
+    trigger a use-after-free and possibly remote code execution.
+    (Closes: #1147421)
+  * CVE-2026-66373: Double free via RESTORE of a stream whose NACK is
+    shared by several consumers, an incomplete fix for CVE-2026-25243;
+    deleting both consumers with XGROUP DELCONSUMER could lead to remote
+    code execution. (Closes: #1147422)
+  * CVE-2026-81934: Use-after-free in tlsProcessPendingData() when
+    handling the TLS pending-data list. A remote unauthenticated
+    attacker may be able to execute arbitrary code with the privileges
+    of the server. (Closes: #1147423)
+  * Some important fixes upstream shipped as security fixes without CVE:
+    - From 8.2.9: ACL key-permission bypass in SORT,
+    GEORADIUS/GEORADIUSBYMEMBER and XREAD/XREADGROUP, out-of-bounds argv
+    access during ACL key extraction for wrong-arity KEYNUM commands,
+    out-of-range SLOT_INFO slot id in RDB loading causing memory corruption,
+    and a use-after-free in handleClientsBlockedOnKey when reprocessing a
+    command evicts another client blocked on the same key.
+    - From 8.0.5: out-of-bounds argv read and crash in HGETEX when the
+    FIELDS option lacks its numfields argument, and an integer overflow in
+    the HyperLogLog MurmurHash64A with entries over 2GB.
 
- -- Tianyu Chen <sweetyfish@deepin.org>  Thu, 21 May 2026 15:47:52 +0800
+ -- Aron Xu <aron@debian.org>  Tue, 15 Sep 2026 00:52:10 +0800
 
 redis (5:8.0.2-3+deb13u2) trixie-security; urgency=high
 

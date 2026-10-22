@@ -1,0 +1,61 @@
+From 9342dda5717738e050116d4093f1202d56cb2286 Mon Sep 17 00:00:00 2001
+From: sggeorgiev <s_ggeorgiev@yahoo.com>
+Date: Sun, 24 Aug 2025 21:20:52 +0300
+Subject: [PATCH] Fix HGETEX out-of-bounds read when FIELDS option missing
+ numfields argument
+
+When the HGETEX command is used with the FIELDS option but without the required
+numfields argument, the server would attempt to access an out-of-bounds argv index.
+
+This PR adds a check to ensure numfields is present before accessing it,
+returning an error if it is missing. Also includes a test case to cover this scenario.
+
+(cherry picked from commit 9342dda5717738e050116d4093f1202d56cb2286)
+---
+ src/t_hash.c                          | 6 ++++++
+ tests/unit/type/hash-field-expire.tcl | 8 +++++---
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/t_hash.c b/src/t_hash.c
+index b7d899368..c5b8284ab 100644
+--- a/src/t_hash.c
++++ b/src/t_hash.c
+@@ -2812,6 +2812,12 @@ void hgetexCommand(client *c) {
+         num_fields_pos += 1;
+     }
+ 
++    /* Check if we have enough arguments */
++    if (num_fields_pos >= c->argc) {
++        addReplyErrorArity(c);
++        return;
++    }
++
+     if (strcasecmp(c->argv[num_fields_pos - 1]->ptr, "FIELDS") != 0) {
+         addReplyError(c, "Mandatory argument FIELDS is missing or not at the right position");
+         return;
+diff --git a/tests/unit/type/hash-field-expire.tcl b/tests/unit/type/hash-field-expire.tcl
+index d1afb9c15..976fd551d 100644
+--- a/tests/unit/type/hash-field-expire.tcl
++++ b/tests/unit/type/hash-field-expire.tcl
+@@ -886,9 +886,9 @@ start_server {tags {"external:skip needs:debug"}} {
+             assert_error "*wrong number of arguments*" {r HGETEX h1 FIELDS}
+             assert_error "*wrong number of arguments*" {r HGETEX h1 FIELDS 0}
+             assert_error "*wrong number of arguments*" {r HGETEX h1 FIELDS 1}
+-            assert_error "*argument FIELDS is missing*" {r HGETEX h1 XFIELDX 1 a}
+-            assert_error "*argument FIELDS is missing*" {r HGETEX h1 PXAT 1 1}
+-            assert_error "*argument FIELDS is missing*" {r HGETEX h1 PERSIST 1 FIELDS 1 a}
++            assert_error "*wrong number of arguments*" {r HGETEX h1 PXAT 1 1}
++            assert_error "*Mandatory argument FIELDS*" {r HGETEX h1 XFIELDX 1 a}
++            assert_error "*Mandatory argument FIELDS*" {r HGETEX h1 PERSIST 1 FIELDS 1 a}
+             assert_error "*must match the number of arguments*" {r HGETEX h1 FIELDS 2 a}
+             assert_error "*Number of fields must be a positive integer*" {r HGETEX h1 FIELDS 0 a}
+             assert_error "*Number of fields must be a positive integer*" {r HGETEX h1 FIELDS -1 a}
+@@ -907,6 +907,8 @@ start_server {tags {"external:skip needs:debug"}} {
+             assert_error "*invalid expire time*" {r HGETEX h1 EXAT [expr (1<<46) + 100 ] FIELDS 1 a}
+             assert_error "*invalid expire time*" {r HGETEX h1 PX [expr (1<<46) - [clock milliseconds] + 100 ] FIELDS 1 a}
+             assert_error "*invalid expire time*" {r HGETEX h1 PXAT [expr (1<<46) + 100 ] FIELDS 1 a}
++            assert_error "*wrong number of arguments*" {r HGETEX missingkey EX 100 FIELDS}
++            assert_error "*wrong number of arguments*" {r EVAL "return redis.call('HGETEX', 'missingkey', 'EX', '100', 'FIELDS')" 0}
+         }
+ 
+         test "HGETEX - get without setting ttl ($type)" {

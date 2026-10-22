@@ -1,0 +1,189 @@
+From a8eec43d9a6b5512e248c9c2b481ca485e56d19d Mon Sep 17 00:00:00 2001
+From: Zijie Zhao <zzjas98@gmail.com>
+Date: Wed, 18 Mar 2026 20:30:56 -0500
+Subject: [PATCH] Fix ACL OOB for wrong-arity KEYNUM commands (#14847)
+
+`luaRedisAclCheckCmdPermissionsCommand` and
+`RM_ACLCheckCommandPermissions` now call `commandCheckArity()` to check
+command arity before calling `ACLCheckAllUserCommandPerm`, matching the
+behavior of `processCommand`, `scriptCall`, and `RM_Call`. Without this,
+KEYNUM keyspec commands like EVAL with wrong arity cause out-of-bounds
+argv access during key extraction.
+
+Also fix KEYNUM index calculation (`first + keynumidx`) and add a bounds
+check in genericGetKeys().
+
+Add scripting and module ACL tests for wrong-arity `EVAL` to lock in the
+non-crashing behavior.
+
+Fixes #14843
+
+(cherry picked from commit c4d74587b55383354f53a5c61bd313ccf7867f4b)
+(cherry picked from commit 1812c6d02038d2dc7bdb9b2ed5e5f1ed1b1838cf)
+(cherry picked from commit a8eec43d9a6b5512e248c9c2b481ca485e56d19d)
+Reviewed-by: Aron Xu <aron@debian.org>
+---
+ src/db.c                          |  9 +++++++--
+ src/module.c                      |  8 +++++++-
+ src/script_lua.c                  |  3 +++
+ src/server.c                      | 10 ++++------
+ src/server.h                      |  2 +-
+ tests/unit/moduleapi/aclcheck.tcl |  5 +++++
+ tests/unit/scripting.tcl          | 12 ++++++++++++
+ 7 files changed, 39 insertions(+), 10 deletions(-)
+
+diff --git a/src/db.c b/src/db.c
+index 59ecf706a..c279f9edd 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -2486,10 +2486,11 @@ int getKeysUsingKeySpecs(struct redisCommand *cmd, robj **argv, int argc, int se
+         } else if (spec->find_keys_type == KSPEC_FK_KEYNUM) {
+             step = spec->fk.keynum.keystep;
+             long long numkeys;
+-            if (spec->fk.keynum.keynumidx >= argc)
++            long keynumidx = first + spec->fk.keynum.keynumidx;
++            if (keynumidx >= argc || keynumidx < 0)
+                 goto invalid_spec;
+ 
+-            sds keynum_str = argv[first + spec->fk.keynum.keynumidx]->ptr;
++            sds keynum_str = argv[keynumidx]->ptr;
+             if (!string2ll(keynum_str,sdslen(keynum_str),&numkeys) || numkeys < 0) {
+                 /* Unable to parse the numkeys argument or it was invalid */
+                 goto invalid_spec;
+@@ -2770,6 +2771,10 @@ int genericGetKeys(int storeKeyOfs, int keyCountOfs, int firstKeyOfs, int keySte
+     int i, num;
+     keyReference *keys;
+ 
++    if (keyCountOfs >= argc) {
++        result->numkeys = 0;
++        return 0;
++    }
+     num = atoi(argv[keyCountOfs]->ptr);
+     /* Sanity check. Don't return any key if the command is going to
+      * reply with syntax error. (no input keys). */
+diff --git a/src/module.c b/src/module.c
+index 07fee9218..cff183a8f 100644
+--- a/src/module.c
++++ b/src/module.c
+@@ -6476,7 +6476,7 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
+             reply = callReplyCreateError(err, ctx);
+         goto cleanup;
+     }
+-    if (!commandCheckArity(c, error_as_call_replies? &err : NULL)) {
++    if (!commandCheckArity(c->cmd, c->argc, error_as_call_replies? &err : NULL)) {
+         errno = EINVAL;
+         if (error_as_call_replies)
+             reply = callReplyCreateError(err, ctx);
+@@ -9811,6 +9811,7 @@ RedisModuleUser *RM_GetModuleUserFromUserName(RedisModuleString *name) {
+  * REDISMODULE_ERR is returned and errno is set to the following values:
+  *
+  * * ENOENT: Specified command does not exist.
++ * * EINVAL: Invalid number of arguments for the specified command.
+  * * EACCES: Command cannot be executed, according to ACL rules
+  */
+ int RM_ACLCheckCommandPermissions(RedisModuleUser *user, RedisModuleString **argv, int argc) {
+@@ -9823,6 +9824,11 @@ int RM_ACLCheckCommandPermissions(RedisModuleUser *user, RedisModuleString **arg
+         return REDISMODULE_ERR;
+     }
+ 
++    if (!commandCheckArity(cmd, argc, NULL)) {
++        errno = EINVAL;
++        return REDISMODULE_ERR;
++    }
++
+     if (ACLCheckAllUserCommandPerm(user->user, cmd, argv, argc, &keyidxptr) != ACL_OK) {
+         errno = EACCES;
+         return REDISMODULE_ERR;
+diff --git a/src/script_lua.c b/src/script_lua.c
+index a541ec755..746ef124b 100644
+--- a/src/script_lua.c
++++ b/src/script_lua.c
+@@ -1123,6 +1123,9 @@ static int luaRedisAclCheckCmdPermissionsCommand(lua_State *lua) {
+     if ((cmd = lookupCommand(argv, argc)) == NULL) {
+         luaPushError(lua, "Invalid command passed to redis.acl_check_cmd()");
+         raise_error = 1;
++    } else if (!commandCheckArity(cmd, argc, NULL)) {
++        luaPushError(lua, "Wrong number of args for redis.acl_check_cmd()");
++        raise_error = 1;
+     } else {
+         int keyidxptr;
+         if (ACLCheckAllUserCommandPerm(rctx->original_client->user, cmd, argv, argc, &keyidxptr) != ACL_OK) {
+diff --git a/src/server.c b/src/server.c
+index fd1180af2..dbff08b01 100644
+--- a/src/server.c
++++ b/src/server.c
+@@ -3943,13 +3943,11 @@ int commandCheckExistence(client *c, sds *err) {
+ 
+ /* Check if c->argc is valid for c->cmd, fills `err` with details in case it isn't.
+  * Return 1 if valid. */
+-int commandCheckArity(client *c, sds *err) {
+-    if ((c->cmd->arity > 0 && c->cmd->arity != c->argc) ||
+-        (c->argc < -c->cmd->arity))
+-    {
++int commandCheckArity(struct redisCommand *cmd, int argc, sds *err) {
++    if ((cmd->arity > 0 && cmd->arity != argc) || (argc < -cmd->arity)) {
+         if (err) {
+             *err = sdsnew(NULL);
+-            *err = sdscatprintf(*err, "wrong number of arguments for '%s' command", c->cmd->fullname);
++            *err = sdscatprintf(*err, "wrong number of arguments for '%s' command", cmd->fullname);
+         }
+         return 0;
+     }
+@@ -4042,7 +4040,7 @@ int processCommand(client *c) {
+             rejectCommandSds(c, err);
+             return C_OK;
+         }
+-        if (!commandCheckArity(c, &err)) {
++        if (!commandCheckArity(c->cmd, c->argc, &err)) {
+             rejectCommandSds(c, err);
+             return C_OK;
+         }
+diff --git a/src/server.h b/src/server.h
+index 17c7099b4..544bb14c5 100644
+--- a/src/server.h
++++ b/src/server.h
+@@ -3273,7 +3273,7 @@ struct redisCommand *lookupCommandByCStringLogic(dict *commands, const char *s);
+ struct redisCommand *lookupCommandByCString(const char *s);
+ struct redisCommand *lookupCommandOrOriginal(robj **argv, int argc);
+ int commandCheckExistence(client *c, sds *err);
+-int commandCheckArity(client *c, sds *err);
++int commandCheckArity(struct redisCommand *cmd, int argc, sds *err);
+ void startCommandExecution(void);
+ int incrCommandStatsOnError(struct redisCommand *cmd, int flags);
+ void call(client *c, int flags);
+diff --git a/tests/unit/moduleapi/aclcheck.tcl b/tests/unit/moduleapi/aclcheck.tcl
+index cf89ea52e..5d9667cf6 100644
+--- a/tests/unit/moduleapi/aclcheck.tcl
++++ b/tests/unit/moduleapi/aclcheck.tcl
+@@ -17,6 +17,11 @@ start_server {tags {"modules acl"}} {
+         assert {[dict get $entry context] eq {module}}
+         assert {[dict get $entry object] eq {set}}
+         assert {[dict get $entry reason] eq {command}}
++
++        # Wrong command arity must fail safely (no crash on KEYNUM keyspec path)
++        r acl setuser default on nopass resetkeys ~restricted:* +@all
++        catch {r aclcheck.rm_call.check.cmd eval script} e
++        assert_match {*DENIED*} $e
+     }
+         
+     test {test module check acl for key prefix permission} {
+diff --git a/tests/unit/scripting.tcl b/tests/unit/scripting.tcl
+index 70189d70b..08e7e0843 100644
+--- a/tests/unit/scripting.tcl
++++ b/tests/unit/scripting.tcl
+@@ -2603,3 +2603,15 @@ start_server {tags {"scripting external:skip large-memory"}} {
+         }
+     }
+ }
++
++start_server {tags {"scripting"}} {
++    test "Wrong arity EVAL in acl_check_cmd returns error not crash" {
++        r acl setuser bob on {>123} {+@scripting} {+set} {~x*}
++        assert_equal [r auth bob 123] {OK}
++        # Must be the first Lua call in this server instance
++        catch {run_script {
++            return redis.acl_check_cmd('eval','script')
++        } 0} e
++        assert_match {*Wrong number of args*} $e
++    }
++}

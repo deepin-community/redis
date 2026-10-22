@@ -1,0 +1,315 @@
+From 00ae4906c2c079c351bd63fd3fd42bd0c4b2c8d0 Mon Sep 17 00:00:00 2001
+From: Sergei Georgiev <s_ggeorgiev@yahoo.com>
+Date: Sat, 18 Jul 2026 10:21:19 +0300
+Subject: [PATCH] Fix ACL key checks for SORT, GEORADIUS/GEORADIUSBYMEMBER, and
+ XREAD/XREADGROUP (#15478)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Several commands resolved ACL keys from a keyspec that didn't match the
+key the command actually operates on, allowing a permission bypass:
+
+- **`GEORADIUS`/`GEORADIUSBYMEMBER`**: the `STORE`/`STOREDIST` keyspec
+matches the **first** occurrence of the keyword, but the command uses
+**last-wins** semantics and writes to the **last** key. So `GEORADIUS
+... STORE <permitted> STORE <forbidden>` passed ACL while writing to the
+forbidden key (same for `STOREDIST` and both commands).
+
+- **`SORT`**: `STORE` also uses last-wins semantics. The `STORE` keyspec
+is already `unknown`, so ACL falls back to `sortGetKeys()` — but that
+parser didn't skip the `STORE` argument. An earlier `STORE` value that
+looks like an option keyword (`BY`/`GET`/`LIMIT`) derailed the scan, so
+a permitted (or non-existent) first key masked a forbidden last key that
+the write actually landed on.
+
+- **`XREAD`/`XREADGROUP`**: the stream keys are the args after the
+`STREAMS` keyword, whose position is found by a static keyspec. A
+consumer/group named `STREAMS`, or options before `GROUP`/`STREAMS`,
+could shift the real `STREAMS` token so ACL validated the wrong argument
+and the read hit a forbidden key.
+
+Make ACL resolve keys via each command's `getKeys` function, which
+returns the effective keys with proper flags:
+
+- **`GEORADIUS`/`GEORADIUSBYMEMBER`**: mark the `STORE`/`STOREDIST`
+keyspecs `INCOMPLETE` so ACL falls back to `georadiusGetKeys()`, which
+returns the last key (`RO|ACCESS` source, `OW|UPDATE` store).
+- **`SORT`**: no keyspec change needed — the `STORE` keyspec is already
+`unknown`, so ACL already delegates to `sortGetKeys()`. Fixed the parser
+to skip the `STORE` argument (`i++`) so it isn't re-parsed as an option
+keyword; the last `STORE` still wins.
+- **`XREAD`/`XREADGROUP`**: mark the keyspecs `INCOMPLETE` and fall back
+to `xreadGetKeys()`, which now skips option arguments (`COUNT`,
+`MAXCOUNT`, `MAXSIZE`, `CLAIM`, `GROUP`, …) to locate the real `STREAMS`
+token and tags the resolved keys `RO|ACCESS`.
+
+Adds `acl-v2` tests for duplicate `STORE`/`STOREDIST`
+(`GEORADIUS`/`GEORADIUSBYMEMBER`, `SORT`) and for the
+`XREAD`/`XREADGROUP` `STREAMS`-keyword confusion.
+
+(cherry picked from commit ce2f04c3fd72978ab7c841a8074621363c11eee0)
+(cherry picked from commit 00ae4906c2c079c351bd63fd3fd42bd0c4b2c8d0)
+---
+ src/commands.def                    |  8 +++---
+ src/commands/georadius.json         |  8 ++++--
+ src/commands/georadiusbymember.json |  8 ++++--
+ src/commands/xread.json             |  4 ++-
+ src/commands/xreadgroup.json        |  4 ++-
+ src/db.c                            | 23 +++++++++-------
+ tests/unit/acl-v2.tcl               | 42 +++++++++++++++++++++++++++++
+ 7 files changed, 77 insertions(+), 20 deletions(-)
+
+diff --git a/src/commands.def b/src/commands.def
+index 5a7545e32..1f594a7eb 100644
+--- a/src/commands.def
++++ b/src/commands.def
+@@ -2853,7 +2853,7 @@ commandHistory GEORADIUS_History[] = {
+ #ifndef SKIP_CMD_KEY_SPECS_TABLE
+ /* GEORADIUS key specs */
+ keySpec GEORADIUS_Keyspecs[3] = {
+-{NULL,CMD_KEY_RO|CMD_KEY_ACCESS,KSPEC_BS_INDEX,.bs.index={1},KSPEC_FK_RANGE,.fk.range={0,1,0}},{NULL,CMD_KEY_OW|CMD_KEY_UPDATE,KSPEC_BS_KEYWORD,.bs.keyword={"STORE",6},KSPEC_FK_RANGE,.fk.range={0,1,0}},{NULL,CMD_KEY_OW|CMD_KEY_UPDATE,KSPEC_BS_KEYWORD,.bs.keyword={"STOREDIST",6},KSPEC_FK_RANGE,.fk.range={0,1,0}}
++{NULL,CMD_KEY_RO|CMD_KEY_ACCESS,KSPEC_BS_INDEX,.bs.index={1},KSPEC_FK_RANGE,.fk.range={0,1,0}},{"Incomplete because duplicate STORE options use last-wins; fall back to georadiusGetKeys",CMD_KEY_OW|CMD_KEY_UPDATE|CMD_KEY_INCOMPLETE,KSPEC_BS_KEYWORD,.bs.keyword={"STORE",6},KSPEC_FK_RANGE,.fk.range={0,1,0}},{"Incomplete because duplicate STOREDIST options use last-wins; fall back to georadiusGetKeys",CMD_KEY_OW|CMD_KEY_UPDATE|CMD_KEY_INCOMPLETE,KSPEC_BS_KEYWORD,.bs.keyword={"STOREDIST",6},KSPEC_FK_RANGE,.fk.range={0,1,0}}
+ };
+ #endif
+ 
+@@ -2916,7 +2916,7 @@ commandHistory GEORADIUSBYMEMBER_History[] = {
+ #ifndef SKIP_CMD_KEY_SPECS_TABLE
+ /* GEORADIUSBYMEMBER key specs */
+ keySpec GEORADIUSBYMEMBER_Keyspecs[3] = {
+-{NULL,CMD_KEY_RO|CMD_KEY_ACCESS,KSPEC_BS_INDEX,.bs.index={1},KSPEC_FK_RANGE,.fk.range={0,1,0}},{NULL,CMD_KEY_OW|CMD_KEY_UPDATE,KSPEC_BS_KEYWORD,.bs.keyword={"STORE",5},KSPEC_FK_RANGE,.fk.range={0,1,0}},{NULL,CMD_KEY_OW|CMD_KEY_UPDATE,KSPEC_BS_KEYWORD,.bs.keyword={"STOREDIST",5},KSPEC_FK_RANGE,.fk.range={0,1,0}}
++{NULL,CMD_KEY_RO|CMD_KEY_ACCESS,KSPEC_BS_INDEX,.bs.index={1},KSPEC_FK_RANGE,.fk.range={0,1,0}},{"Incomplete because duplicate STORE options use last-wins; fall back to georadiusGetKeys",CMD_KEY_OW|CMD_KEY_UPDATE|CMD_KEY_INCOMPLETE,KSPEC_BS_KEYWORD,.bs.keyword={"STORE",5},KSPEC_FK_RANGE,.fk.range={0,1,0}},{"Incomplete because duplicate STOREDIST options use last-wins; fall back to georadiusGetKeys",CMD_KEY_OW|CMD_KEY_UPDATE|CMD_KEY_INCOMPLETE,KSPEC_BS_KEYWORD,.bs.keyword={"STOREDIST",5},KSPEC_FK_RANGE,.fk.range={0,1,0}}
+ };
+ #endif
+ 
+@@ -10238,7 +10238,7 @@ struct COMMAND_ARG XRANGE_Args[] = {
+ #ifndef SKIP_CMD_KEY_SPECS_TABLE
+ /* XREAD key specs */
+ keySpec XREAD_Keyspecs[1] = {
+-{NULL,CMD_KEY_RO|CMD_KEY_ACCESS,KSPEC_BS_KEYWORD,.bs.keyword={"STREAMS",1},KSPEC_FK_RANGE,.fk.range={-1,1,2}}
++{"Incomplete because a stream key named STREAMS (or options before it) can shift the STREAMS keyword; fall back to xreadGetKeys",CMD_KEY_RO|CMD_KEY_ACCESS|CMD_KEY_INCOMPLETE,KSPEC_BS_KEYWORD,.bs.keyword={"STREAMS",1},KSPEC_FK_RANGE,.fk.range={-1,1,2}}
+ };
+ #endif
+ 
+@@ -10270,7 +10270,7 @@ struct COMMAND_ARG XREAD_Args[] = {
+ #ifndef SKIP_CMD_KEY_SPECS_TABLE
+ /* XREADGROUP key specs */
+ keySpec XREADGROUP_Keyspecs[1] = {
+-{NULL,CMD_KEY_RO|CMD_KEY_ACCESS,KSPEC_BS_KEYWORD,.bs.keyword={"STREAMS",4},KSPEC_FK_RANGE,.fk.range={-1,1,2}}
++{"Incomplete because a consumer/group named STREAMS (or options before GROUP) can shift the STREAMS keyword; fall back to xreadGetKeys",CMD_KEY_RO|CMD_KEY_ACCESS|CMD_KEY_INCOMPLETE,KSPEC_BS_KEYWORD,.bs.keyword={"STREAMS",4},KSPEC_FK_RANGE,.fk.range={-1,1,2}}
+ };
+ #endif
+ 
+diff --git a/src/commands/georadius.json b/src/commands/georadius.json
+index 6ced9049c..834f84ac9 100644
+--- a/src/commands/georadius.json
++++ b/src/commands/georadius.json
+@@ -49,9 +49,11 @@
+                 }
+             },
+             {
++                "notes": "Incomplete because duplicate STORE options use last-wins; fall back to georadiusGetKeys",
+                 "flags": [
+                     "OW",
+-                    "UPDATE"
++                    "UPDATE",
++                    "INCOMPLETE"
+                 ],
+                 "begin_search": {
+                     "keyword": {
+@@ -68,9 +70,11 @@
+                 }
+             },
+             {
++                "notes": "Incomplete because duplicate STOREDIST options use last-wins; fall back to georadiusGetKeys",
+                 "flags": [
+                     "OW",
+-                    "UPDATE"
++                    "UPDATE",
++                    "INCOMPLETE"
+                 ],
+                 "begin_search": {
+                     "keyword": {
+diff --git a/src/commands/georadiusbymember.json b/src/commands/georadiusbymember.json
+index 6102a1b16..e6198702b 100644
+--- a/src/commands/georadiusbymember.json
++++ b/src/commands/georadiusbymember.json
+@@ -49,9 +49,11 @@
+                 }
+             },
+             {
++                "notes": "Incomplete because duplicate STORE options use last-wins; fall back to georadiusGetKeys",
+                 "flags": [
+                     "OW",
+-                    "UPDATE"
++                    "UPDATE",
++                    "INCOMPLETE"
+                 ],
+                 "begin_search": {
+                     "keyword": {
+@@ -68,9 +70,11 @@
+                 }
+             },
+             {
++                "notes": "Incomplete because duplicate STOREDIST options use last-wins; fall back to georadiusGetKeys",
+                 "flags": [
+                     "OW",
+-                    "UPDATE"
++                    "UPDATE",
++                    "INCOMPLETE"
+                 ],
+                 "begin_search": {
+                     "keyword": {
+diff --git a/src/commands/xread.json b/src/commands/xread.json
+index 95e22c494..5b94df724 100644
+--- a/src/commands/xread.json
++++ b/src/commands/xread.json
+@@ -15,9 +15,11 @@
+         ],
+         "key_specs": [
+             {
++                "notes": "Incomplete because a stream key named STREAMS (or options before it) can shift the STREAMS keyword; fall back to xreadGetKeys",
+                 "flags": [
+                     "RO",
+-                    "ACCESS"
++                    "ACCESS",
++                    "INCOMPLETE"
+                 ],
+                 "begin_search": {
+                     "keyword": {
+diff --git a/src/commands/xreadgroup.json b/src/commands/xreadgroup.json
+index 93e45a877..3020c3af9 100644
+--- a/src/commands/xreadgroup.json
++++ b/src/commands/xreadgroup.json
+@@ -16,9 +16,11 @@
+         ],
+         "key_specs": [
+             {
++                "notes": "Incomplete because a consumer/group named STREAMS (or options before GROUP) can shift the STREAMS keyword; fall back to xreadGetKeys",
+                 "flags": [
+                     "RO",
+-                    "ACCESS"
++                    "ACCESS",
++                    "INCOMPLETE"
+                 ],
+                 "begin_search": {
+                     "keyword": {
+diff --git a/src/db.c b/src/db.c
+index 508c342fb..59ecf706a 100644
+--- a/src/db.c
++++ b/src/db.c
+@@ -2902,12 +2902,12 @@ int sortGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *
+                 i += skiplist[j].skip;
+                 break;
+             } else if (!strcasecmp(argv[i]->ptr,"store") && i+1 < argc) {
+-                /* Note: we don't increment "num" here and continue the loop
+-                 * to be sure to process the *last* "STORE" option if multiple
+-                 * ones are provided. This is same behavior as SORT. */
++                /* Don't increment "num" so the *last* STORE option wins if
++                 * several are given (same behavior as SORT). */
+                 found_store = 1;
+                 keys[num].pos = i+1; /* <store-key> */
+                 keys[num].flags = CMD_KEY_OW | CMD_KEY_UPDATE;
++                i++; /* Skip the store argument so it isn't re-parsed as an option keyword. */
+                 break;
+             }
+         }
+@@ -2972,8 +2972,10 @@ int migrateGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResul
+  * GEORADIUS key x y radius unit [WITHDIST] [WITHHASH] [WITHCOORD] [ASC|DESC]
+  *                             [COUNT count] [STORE key|STOREDIST key]
+  * GEORADIUSBYMEMBER key member radius unit ... options ...
+- * 
+- * This command has a fully defined keyspec, so returning flags isn't needed. */
++ *
++ * STORE/STOREDIST keyspecs are marked incomplete because duplicate options
++ * use last-wins semantics (same as georadiusGeneric). ACL and other callers
++ * of getKeysFromCommandWithSpecs fall back here. */
+ int georadiusGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+     int i, num;
+     keyReference *keys;
+@@ -3002,10 +3004,10 @@ int georadiusGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysRes
+ 
+     /* Add all key positions to keys[] */
+     keys[0].pos = 1;
+-    keys[0].flags = 0;
+-    if(num > 1) {
++    keys[0].flags = CMD_KEY_RO | CMD_KEY_ACCESS;
++    if (num > 1) {
+          keys[1].pos = stored_key;
+-         keys[1].flags = 0;
++         keys[1].flags = CMD_KEY_OW | CMD_KEY_UPDATE;
+     }
+     result->numkeys = num;
+     return num;
+@@ -3014,7 +3016,8 @@ int georadiusGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysRes
+ /* XREAD [BLOCK <milliseconds>] [COUNT <count>] [GROUP <groupname> <ttl>]
+  *       STREAMS key_1 key_2 ... key_N ID_1 ID_2 ... ID_N
+  *
+- * This command has a fully defined keyspec, so returning flags isn't needed. */
++ * The keyspec is incomplete, so callers fall back to this function to parse
++ * the options and locate the real STREAMS token. */
+ int xreadGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult *result) {
+     int i, num = 0;
+     keyReference *keys;
+@@ -3055,7 +3058,7 @@ int xreadGetKeys(struct redisCommand *cmd, robj **argv, int argc, getKeysResult
+     keys = getKeysPrepareResult(result, num);
+     for (i = streams_pos+1; i < argc-num; i++) {
+         keys[i-streams_pos-1].pos = i;
+-        keys[i-streams_pos-1].flags = 0; 
++        keys[i-streams_pos-1].flags = CMD_KEY_RO | CMD_KEY_ACCESS;
+     } 
+     result->numkeys = num;
+     return num;
+diff --git a/tests/unit/acl-v2.tcl b/tests/unit/acl-v2.tcl
+index b233118dd..bc7cf45c6 100644
+--- a/tests/unit/acl-v2.tcl
++++ b/tests/unit/acl-v2.tcl
+@@ -397,6 +397,48 @@ start_server {tags {"acl external:skip"}} {
+         assert_match {*has no permissions to access the 'write1' key*} [r ACL DRYRUN command-test GEORADIUS write1 longitude latitude radius M STORE write2]
+     }
+ 
++    test {Test GEORADIUS duplicate STORE is checked against the last key} {
++        r ACL setuser command-test +@all %R~read* %W~write* %RW~rw*
++
++        # Duplicate STORE/STOREDIST uses last-wins semantics (same as
++        # georadiusGeneric), so ACL must validate the last key. Otherwise a
++        # permitted first key would mask a forbidden second key.
++        assert_equal "OK" [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M STORE read1 STORE write2]
++        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M STORE write1 STORE read2]
++        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUS read longitude latitude radius M STOREDIST write1 STOREDIST read2]
++
++        assert_equal "OK" [r ACL DRYRUN command-test GEORADIUSBYMEMBER read member radius M STORE read1 STORE write2]
++        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUSBYMEMBER read member radius M STORE write1 STORE read2]
++        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test GEORADIUSBYMEMBER read member radius M STOREDIST write1 STOREDIST read2]
++    }
++
++    test {Test SORT duplicate STORE is checked against the last key} {
++        r ACL setuser command-test +@all %R~read* %W~write* %RW~rw*
++
++        # Duplicate STORE uses last-wins semantics, so ACL must validate the
++        # last key. The earlier STORE argument can look like an option keyword
++        # (BY/GET/LIMIT) and must be skipped so a permitted first key doesn't
++        # mask a forbidden last key.
++        assert_equal "OK" [r ACL DRYRUN command-test SORT read STORE by STORE write2]
++        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test SORT read STORE by STORE read2]
++        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test SORT read STORE get STORE read2]
++        assert_match {*has no permissions to access the 'read2' key*} [r ACL DRYRUN command-test SORT read STORE limit STORE read2]
++    }
++
++    test {Test XREADGROUP STREAMS keyword is not confused with the consumer name} {
++        r ACL setuser command-test +@all %R~read* %W~write* %RW~rw*
++
++        # A consumer literally named "STREAMS" must not be mistaken for the
++        # STREAMS option, otherwise ACL validates the wrong argument.
++        assert_equal "OK" [r ACL DRYRUN command-test XREADGROUP NOACK GROUP g STREAMS STREAMS read2 >]
++        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREADGROUP NOACK GROUP g STREAMS STREAMS write2 >]
++        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREADGROUP COUNT 1 GROUP g STREAMS STREAMS write2 >]
++
++        # Sanity: a normal consumer name still validates the real stream key.
++        assert_equal "OK" [r ACL DRYRUN command-test XREADGROUP GROUP g consumer STREAMS read2 >]
++        assert_match {*has no permissions to access the 'write2' key*} [r ACL DRYRUN command-test XREADGROUP GROUP g consumer STREAMS write2 >]
++    }
++
+     # Existence test commands are not marked as access since they are the result
+     # of a lot of write commands. We therefore make the claim they can be executed
+     # when either READ or WRITE flags are provided.

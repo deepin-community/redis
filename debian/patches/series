@@ -12,4 +12,14 @@ debian-packaging/0001-Set-Debian-configuration-defaults.patch
 0011-CVE-2025-46817.patch
 0012-CVE-2025-67733.patch
 0013-CVE-2026-21863.patch
-0015-Add-sw64-support.patch
+0014-CVE-2026-25243.patch
+0015-CVE-2026-23631.patch
+0016-CVE-2026-23479.patch
+0017-CVE-2026-66373.patch
+0018-CVE-2026-81934.patch
+0019-Fix-ACL-key-checks-for-SORT-GEORADIUS-XREAD.patch
+0020-Fix-ACL-OOB-for-wrong-arity-KEYNUM-commands.patch
+0021-Check-slotinfo-range-when-loading-RDB.patch
+0022-Fix-use-after-free-in-handleClientsBlockedOnKey.patch
+0023-Fix-HGETEX-out-of-bounds-read-when-FIELDS-lacks-numfields.patch
+0024-Fix-MurmurHash64A-overflow-in-HyperLogLog.patch
