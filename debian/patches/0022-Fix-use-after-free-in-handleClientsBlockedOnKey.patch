@@ -1,0 +1,110 @@
+From 009324be81f7105313ce6586ed4807f03c62c7fe Mon Sep 17 00:00:00 2001
+From: Yuan Wang <yuan.wang@redis.com>
+Date: Thu, 6 Aug 2026 16:52:31 +0800
+Subject: [PATCH] Fix use-after-free in handleClientsBlockedOnKey (#15594)
+
+Fixes https://github.com/redis/redis/issues/15562.
+
+handleClientsBlockedOnKey() used a list iterator while reprocessing clients
+blocked on the same key. Reprocessing one client may trigger client eviction,
+which can remove another blocked client and free the node cached by the
+iterator, resulting in a use-after-free.
+
+Replace the iterator with a bounded head-to-tail traversal. Before reprocessing
+a client, move its node to the tail so the next waiter remains at the head while
+preserving FIFO order. Since reprocessing may remove all blocked clients and
+free the list, look up the list again before each iteration.
+
+(cherry picked from commit a8edcfc98c50bb01c850e5dab3998ce57807144d)
+(cherry picked from commit 009324be81f7105313ce6586ed4807f03c62c7fe)
+---
+ src/blocked.c                  | 21 ++++++++++++-----
+ tests/unit/client-eviction.tcl | 41 ++++++++++++++++++++++++++++++++++
+ 2 files changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/src/blocked.c b/src/blocked.c
+index 4d65f56ec..b04fec3d2 100644
+--- a/src/blocked.c
++++ b/src/blocked.c
+@@ -560,14 +560,25 @@ static void handleClientsBlockedOnKey(readyList *rl) {
+ 
+     if (de) {
+         list *clients = dictGetVal(de);
+-        listNode *ln;
+-        listIter li;
+-        listRewind(clients,&li);
+-
+         /* Avoid processing more than the initial count so that we're not stuck
+          * in an endless loop in case the reprocessing of the command blocks again. */
+         long count = listLength(clients);
+-        while ((ln = listNext(&li)) && count--) {
++        while (count-- > 0) {
++            /* Processing the previous client may have removed all blocked
++             * clients and freed the list, so look it up again each time. */
++            de = dictFind(rl->db->blocking_keys, rl->key);
++            if (!de) break;
++            list *clients = dictGetVal(de);
++            listNode *ln = listFirst(clients);
++            serverAssert(ln);
++
++            /* Rotate before reprocessing because unblocking may remove this
++             * client, and command reprocessing may evict other blocked clients
++             * and free the list. If the client remains blocked or blocks again,
++             * keeping it at the tail lets us advance to the next client while
++             * preserving the order of the other waiters. */
++            listRotateHeadToTail(clients);
++
+             client *receiver = listNodeValue(ln);
+             robj *o = lookupKeyReadWithFlags(rl->db, rl->key, LOOKUP_NOEFFECTS);
+             /* 1. In case new key was added/touched we need to verify it satisfy the
+diff --git a/tests/unit/client-eviction.tcl b/tests/unit/client-eviction.tcl
+index 62e42580c..24c8a5c66 100644
+--- a/tests/unit/client-eviction.tcl
++++ b/tests/unit/client-eviction.tcl
+@@ -636,5 +636,46 @@ start_server {} {
+     }
+ }
+ 
++start_server {} {
++    test "Evicting the next client while serving blocked clients is safe" {
++        r flushall
++        r client no-evict on
++        r config set maxmemory-clients 0
++
++        set rd1 [redis_deferring_client]
++        set rd2 [redis_deferring_client]
++        $rd2 CLIENT SETNAME client-to-evict
++        assert_equal OK [$rd2 read]
++
++        # Block two clients on the same key in a known order.
++        $rd1 BLPOP mylist 0
++        wait_for_blocked_clients_count 1
++        $rd2 BLPOP mylist 0
++        wait_for_blocked_clients_count 2
++
++        # Queue a large request behind the second client's blocking command so
++        # it will be selected for eviction while the first client is processed.
++        $rd2 get [string repeat Q [kb 2048]]
++        wait_for_condition 50 100 {
++            [client_field client-to-evict tot-mem] > [mb 1]
++        } else {
++            fail "Failed to increase the second blocked client's memory usage"
++        }
++
++        # Apply the client-memory limit and make the key ready in one transaction.
++        # Eviction then runs while rd1 is being reprocessed, selecting rd2 while
++        # it is still in the blocked-client list.
++        r MULTI
++        r CONFIG SET MAXMEMORY-CLIENTS [kb 128]
++        r LPUSH mylist x
++        r EXEC
++
++        assert_equal {mylist x} [$rd1 read]
++        assert {![client_exists client-to-evict]} ;# rd2 is evicted
++        $rd1 close
++        $rd2 close
++    }
++}
++
+ } ;# tags
+ 
