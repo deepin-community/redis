@@ -1,3 +1,9 @@
+redis (5:8.0.2-3+deb13u3deepin1) unstable; urgency=medium
+
+  * Add sw64 support
+
+ -- Tianyu Chen <sweetyfish@deepin.org>  Thu, 22 Oct 2026 17:23:12 +0800
+
 redis (5:8.0.2-3+deb13u3) trixie-security; urgency=high
 
   * Non-maintainer upload by the Security Team.
