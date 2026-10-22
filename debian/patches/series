@@ -23,3 +23,4 @@ debian-packaging/0001-Set-Debian-configuration-defaults.patch
 0022-Fix-use-after-free-in-handleClientsBlockedOnKey.patch
 0023-Fix-HGETEX-out-of-bounds-read-when-FIELDS-lacks-numfields.patch
 0024-Fix-MurmurHash64A-overflow-in-HyperLogLog.patch
+0025-Add-sw64-support.patch
