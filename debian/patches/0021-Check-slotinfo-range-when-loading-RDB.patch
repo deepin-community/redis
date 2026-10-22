@@ -1,0 +1,59 @@
+From b1030a2f66311d5a03c58ebdeb5ade77daf74fe5 Mon Sep 17 00:00:00 2001
+From: Mincho Paskalev <minchopaskal@gmail.com>
+Date: Tue, 21 Jul 2026 15:34:32 +0300
+Subject: [PATCH] Check slotinfo range when loading RDB (#1541)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Redis has a memory corruption bug in the RDB loader’s SLOT_INFO
+handling. A malicious RDB can provide invalid slot metadata that makes
+Redis use a slot id outside the normal cluster slot range while
+preparing per-slot dictionaries during load.
+With the right heap layout, that out-of-bounds slot lookup can be made
+to land on attacker-controlled data that was also loaded from the RDB.
+Redis then treats that data as a real dictionary structure
+
+The attacker can uses this to build a fake dictionary and fake callback
+table in memory, then reaches code execution as the Redis process. The
+cluster-bus INTERNALSECRET issue is used to get an internal Redis
+connection and make the target replicate from an attacker-controlled
+fake master. The fake master then serves the malicious SLOT_INFO RDB.
+The actual RCE primitive is the RDB-loader bug.
+Source review shows the same SLOT_INFO loader pattern in Redis 7.4.x
+through 8.8-m03; I verified full RCE on 8.6.2.
+
+The issue is that Redis trusts SLOT_INFO metadata from the RDB too much.
+During RDB load, Redis reads slot_id, slot_size, and expires_slot_size
+from the file, then passes the slot id directly into kvstore dictionary
+expansion.
+
+Just check the slot_id is in range.
+
+(cherry picked from commit e92a526973b660071f51078b81ee17aeab359f84)
+(cherry picked from commit b1030a2f66311d5a03c58ebdeb5ade77daf74fe5)
+---
+ src/rdb.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/rdb.c b/src/rdb.c
+index e6545d944..cf23d5c1b 100644
+--- a/src/rdb.c
++++ b/src/rdb.c
+@@ -3442,6 +3442,16 @@ int rdbLoadRioWithLoadingCtx(rio *rdb, int rdbflags, rdbSaveInfo *rsi, rdbLoadin
+             if (!server.cluster_enabled) {
+                 continue; /* Ignore gracefully. */
+             }
++            /* slot_id comes straight from the RDB and is used as an index into the
++             * per-slot kvstore dictionaries. A malformed RDB can supply a value
++             * outside the valid slot range, which would be truncated to a negative or
++             * out-of-range int index inside the kvstore layer and cause an
++             * out-of-bounds access. Reject such records as corrupt before expanding. */
++            if (slot_id >= (uint64_t)kvstoreNumDicts(db->keys)) {
++                rdbReportCorruptRDB("SLOT_INFO slot id %llu is out of range (max %d)",
++                    (unsigned long long)slot_id, kvstoreNumDicts(db->keys));
++                return C_ERR;
++            }
+             /* In cluster mode we resize individual slot specific dictionaries based on the number of keys that slot holds. */
+             kvstoreDictExpand(db->keys, slot_id, slot_size);
+             kvstoreDictExpand(db->expires, slot_id, expires_slot_size);
